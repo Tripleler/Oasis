@@ -1,33 +1,10 @@
-"""
-패치노트 1.0.1
-1. 파일명 변경시 한국어를 무시하는 오류 수정
-2. 라이브러리 openpyxl 추가
-3. 일부 어색한 문구 수정
-4. 시트 저장 관련 오류수정 및 최적화
-패치노트 1.0.2
-1. 딥러닝 장치 CPU 옵션 추가
-2. GPU 호환이 되지 않을 경우에도 자동으로 CPU를 사용하도록 적용
-3. 프로그램 사용 도중 사진을 읽어올 수 없을 경우 더미파일이 생성되는 문제 수정
-패치노트 1.0.3
-1. 임시저장이 되지 않는 오류 수정
-2. 프로그램 로그를 기록하는 기능을 추가
-3. 프로그램이 비정상종료 되는 치명적인 오류 발생 시 종료 대신 메세지를 띄우도록 수정
-패치노트 1.0.4
-1. 단축키가 간헐적으로 작동하지 않는 문제 완화
- (작동하지 않을 경우 esc 키를 한번씩 눌러주세요.)
-2. 동물종 목록 시스템 개편
- - 드래그&드롭으로 동물종 명의 위치를 수정 가능
- - 기본제공 동물 DB 추가
-  (포유류 125종, 조류 545종, 파충류32종 합 702종)
- - 국명으로 추가시 학명 자동 등록
-"""
 import sys
 import os
+from collections import deque
 import re
 import time
 import platform
 import traceback
-import win32file
 import yaml
 import math
 import shutil
@@ -61,7 +38,14 @@ import openpyxl
 
 ##########################################
 
-version = '1.0.4'
+try:  # pyinstaller splash option
+    import pyi_splash
+
+    pyi_splash.close()
+except ModuleNotFoundError:
+    pass
+
+version = '1.1.0'
 
 app = QApplication(sys.argv)
 screen = app.primaryScreen()
@@ -76,24 +60,8 @@ IMG_FORMATS = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp', 'mpo']
 VID_FORMATS = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # acceptable video suffixes
 DEFAULT_COLUMNS = ['파일명', '년', '월', '일', '시', '분', '주야간', '국명', '학명', '개체수', '온도', '최대정확도', '최소정확도']  # 고정 칼럼
 DEFAULT_ANIMAL = ['미동정', '멧돼지', '고라니', '산양']
+DEFAULT_SHORTCUT = ['F', 'M', 'N', 'P', 'A', 'D', 'S', 'X']
 icon = QIcon('./icon/logo2.png')
-
-
-def check_update(version='1.0.0', test=False):
-    if test:
-        page = requests.get(f'https://tripleler.tistory.com/entry/Oasis-100')
-        if page.status_code == 200:
-            print('update check!')
-            return
-    else:
-        next_version = [str(int(version.split('.')[0]) + 1) + '.0.0',
-                        version.split('.')[0] + '.' + str(int(version.split('.')[1]) + 1) + '.0',
-                        version.split('.')[0] + '.' + version.split('.')[1] + '.' + str(int(version.split('.')[2]) + 1)]
-        for v in next_version:
-            page = requests.get(f'https://tripleler.tistory.com/entry/Oasis-{v}')
-            if page.status_code == 200:
-                return True
-        return False
 
 
 def time_sync():
@@ -154,17 +122,25 @@ def check_font(font='Arial.ttf', size=10):
 def check_appdata(file='app_data.yaml'):
     dir = CONFIG_DIR / file
     if not dir.exists():
-        return {'columns': DEFAULT_COLUMNS, 'category': DEFAULT_ANIMAL}
+        return {'columns': DEFAULT_COLUMNS, 'category': DEFAULT_ANIMAL, 'shortcut': DEFAULT_SHORTCUT}
     else:
-        with open(dir, 'r', encoding='utf-8') as f:
-            data = yaml.load(f, Loader=yaml.FullLoader)
-        if 'columns' not in data.keys() or not isinstance(data['columns'], list) \
-                or data['columns'][:len(DEFAULT_COLUMNS)] != DEFAULT_COLUMNS:
-            data['columns'] = DEFAULT_COLUMNS
-        if 'category' not in data.keys() or not isinstance(data['category'], list) \
-                or len([x for x in DEFAULT_ANIMAL if x in data['category']]) != len(DEFAULT_ANIMAL):
-            data['category'] = DEFAULT_ANIMAL
-        return data
+        try:
+            with open(dir, 'r', encoding='utf-8') as f:
+                data = yaml.load(f, Loader=yaml.FullLoader)
+        except Exception as e:
+            logger.warning('check_app_data error', exc_info=e)
+            return {'columns': DEFAULT_COLUMNS, 'category': DEFAULT_ANIMAL, 'shortcut': DEFAULT_SHORTCUT}
+        else:  # 데이터 손상 체크
+            if 'columns' not in data.keys() or not isinstance(data['columns'], list) \
+                    or data['columns'][:len(DEFAULT_COLUMNS)] != DEFAULT_COLUMNS:
+                data['columns'] = DEFAULT_COLUMNS
+            if 'category' not in data.keys() or not isinstance(data['category'], list) \
+                    or len([x for x in DEFAULT_ANIMAL if x in data['category']]) != len(DEFAULT_ANIMAL):
+                data['category'] = DEFAULT_ANIMAL
+            if 'shortcut' not in data.keys() or not isinstance(data['shortcut'], list) \
+                    or len(data['shortcut']) != len(DEFAULT_SHORTCUT):
+                data['shortcut'] = DEFAULT_SHORTCUT
+            return data
 
 
 def check_animal_db(file='animal_db.yaml'):
@@ -255,23 +231,6 @@ qt_exception_hook = UncaughtHook()
 
 
 # End logger & Exception ==============================================================================================
-
-
-def locate_usb():
-    drive_list = []
-    drivebits = win32file.GetLogicalDrives()
-    for d in range(1, 26):
-        mask = 1 << d
-        if drivebits & mask:
-            # here if the drive is at least there
-            drname = '%c:\\' % chr(ord('A') + d)
-            t = win32file.GetDriveType(drname)
-            if t == win32file.DRIVE_REMOVABLE:
-                drive_list.append(drname[:2])
-    return drive_list
-
-
-DRIVE = locate_usb()
 
 
 def is_ascii(s=''):
@@ -379,7 +338,7 @@ def select_device(device='', batch_size=None):
     cpu = device == 'cpu'
     if cpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # force torch.cuda.is_available() = False
-        info = '   CPU 사용중     '
+        info = "    CPU 사용중    "
     elif device:  # non-cpu device requested
         os.environ['CUDA_VISIBLE_DEVICES'] = device  # set environment variable
         assert torch.cuda.is_available(), f'CUDA unavailable, invalid device {device} requested'  # check availability
@@ -394,9 +353,10 @@ def select_device(device='', batch_size=None):
         for i, d in enumerate(devices):
             p = torch.cuda.get_device_properties(i)
             s += f"{'' if i == 0 else space}CUDA:{d} ({p.name}, {p.total_memory / 1024 ** 2}MB)\n"  # bytes to MB
-            info = f'   GPU 사용중 ({p.name}, {p.total_memory / 1024 ** 2}MB)     '
+            info = f"    GPU 사용중 ({p.name}, {p.total_memory / 1024 ** 2}MB)    "
     else:
         s += 'CPU\n'
+        info = "    GPU 사용불가 CPU 사용중    "
     # print(s)  # emoji-safe
     return torch.device('cuda:0' if cuda else 'cpu'), info
 
@@ -730,6 +690,7 @@ class DetThread(QThread):  # 쓰레드 정의
         self.auto = False  # 자동분류 여부
         self.error = './icon/error.JPG'
         self.device = ''
+        self.brightness = 0
 
     def play(self):  # 재생 함수
         cv2.destroyAllWindows()  # 확대된 사진이 있을 경우 닫음
@@ -768,7 +729,7 @@ class DetThread(QThread):  # 쓰레드 정의
                 self.frames = int(self.vid_cap.get(cv2.CAP_PROP_FRAME_COUNT))  # total lbl_frame  총 프레임
             self.send_night.emit(False)  # reset noon/night(to noon)  주야간 초기화 (주간처리)
             self.status = True  # resume while loop  반복문 활성화
-            self.send_det.emit(0)  # reset number of detection  개체 수 초기화
+            # self.send_det.emit(0)  # reset number of detection  개체 수 초기화
             if self.mode == 'video':  # 비디오면
                 self.send_status.emit(1)  # video is running
             self.cond.wakeAll()  # resume thread  쓰레드 활성화
@@ -778,7 +739,7 @@ class DetThread(QThread):  # 쓰레드 정의
 
     def prev(self):  # 이전 파일 불러오는 함수
         cv2.destroyAllWindows()  # 확대된 사진이 있을 경우 닫음
-        self.send_det.emit(0)  # reset number of detection  개체 수 초기화
+        # self.send_det.emit(0)  # reset number of detection  개체 수 초기화
         self.frame = 0  # reset lbl_frame  프레임 초기화
         self.auto_li.clear()  # reset animal list  동물목록 초기화
         self.conf_li.clear()  # reset confidence list  신뢰도목록 초기화
@@ -816,7 +777,7 @@ class DetThread(QThread):  # 쓰레드 정의
             self.vid_cap.release()
         except Exception:
             pass
-        self.send_det.emit(0)  # reset number of detection  개체 수 초기화
+        # self.send_det.emit(0)  # reset number of detection  개체 수 초기화
         self.auto_li.clear()  # reset animal list  동물목록 초기화
         self.conf_li.clear()  # reset confidence list  신뢰도목록 초기화
         self.anicount = 0  # reset number of detection 개체 수 초기화
@@ -839,6 +800,21 @@ class DetThread(QThread):  # 쓰레드 정의
             self.send_status.emit(1)  # video is running
         self.cond.wakeAll()  # resume thread  쓰레드 활성화
         logger.info('move')
+
+    def refresh(self):
+        cv2.destroyAllWindows()
+        if self.mode == 'image':
+            self.status = True  # resume while loop  반복문 활성화
+            self.cond.wakeAll()  # run thread once  쓰레드 1번 돌림
+        elif not self.status:  # When video stopped
+            if self.vid_cap is not None:
+                self.frame -= 1
+                self.vid_cap.set(cv2.CAP_PROP_POS_FRAMES, self.frame)  # set video to current lbl_frame
+            self.status = True  # resume while loop  반복문 활성화
+            self.send_status.emit(1)  # video is running
+            self.cond.wakeAll()  # resume thread  쓰레드 활성화
+            self.status = False  # pause while loop(to run once)  반복문 비활성화(첫 프레임만 처리)
+            self.send_status.emit(2)  # video is stopped
 
     def speed_slow(self, sp_text):  # 속도 조절 함수
         self.speed_up = False
@@ -898,10 +874,12 @@ class DetThread(QThread):  # 쓰레드 정의
         # Initialize
         if self.weights:  # 모델을 선택하면
             device, info = select_device(self.device)  # gpu or cpu
+            logger.warning('Select_device complete!')
 
             # Load model
-            self.send_info.emit('딥러닝 모델을 불러오는 중...')
+            self.send_info.emit('    딥러닝 모델을 불러오는 중...    ')
             model, device, info = attempt_load(self.weights, map_location=device, info=info)
+            logger.warning('Attempt_load complete!')
             stride = int(model.stride.max())  # model stride  커널 보폭(32)
             self.names = model.module.names if hasattr(model, 'module') else model.names  # get class names
             self.names.append('Unknown')  # unknown 추가
@@ -909,9 +887,12 @@ class DetThread(QThread):  # 쓰레드 정의
             # Run inference
             if device.type != 'cpu':  # if gpu
                 model(torch.zeros(1, 3, *imgsz).to(device).type_as(next(model.parameters())))  # run once
-            self.send_info.emit(info)
+                logger.warning('Run inference complete!')
         else:  # 모델이 없으면
-            self.send_info.emit('영상인식 AI를 활용하고 있지 않습니다.')
+            info = '    영상인식 AI를 활용하고 있지 않습니다.    '
+
+        self.send_info.emit(info)  # register
+        logger.warning(info)
         dt = [0.0, 0.0, 0.0]  # time check
         p = str(Path(self.source).resolve())  # os-agnostic absolute path
         files = natsorted(glob(os.path.join(p, '*.*')))  # dir
@@ -931,15 +912,18 @@ class DetThread(QThread):  # 쓰레드 정의
         self.count = 0
         self.path = self.files[self.count]
         self.send_path.emit(self.path)  # path signal
+
         if not ni or self.auto:  # First file is video or automode
             self.send_status.emit(1)  # video is running
         self.send_night.emit(False)  # reset noon/night(to noon)  주야간 초기화 (주간처리)
         self.send_cnt.emit(f'1/{self.nf}')  # 1 / 총 파일 개수 표기
         self.stop = False
+
         if self.auto:
             ff = np.fromfile('./icon/auto.JPG', np.uint8)  # 자동모드 처리중 표시
             img = cv2.imdecode(ff, cv2.IMREAD_COLOR)
             self.send_img.emit(img)
+
         while True:  # 처리 시작
             self.mutex.lock()  # 반복문 잠금
             if not self.status:  # 일시정지 요청시
@@ -1109,29 +1093,10 @@ class DetThread(QThread):  # 쓰레드 정의
 
                         # Print time (inference-only)
                         print(f'{s}Done. ({t3 - t2:.3f}s)')  # 1221
-                        # cv2.waitKey(1)  # 1 millisecond
-                        # Stream results
                         im0 = annotator.result()  # 처리 사진
-
-                        # Save results (image with detections)
-                        # if save_img:
-                        #     if self.mode == 'image':
-                        #         cv2.imwrite(save_path, im0)
-                        #     else:  # 'video' or 'stream'
-                        #         if vid_path[i] != save_path:  # new video
-                        #             vid_path[i] = save_path
-                        #             if isinstance(vid_writer[i], cv2.VideoWriter):
-                        #                 vid_writer[i].release()  # release previous video writer
-                        #             if self.vid_cap:  # video
-                        #                 fps = self.vid_cap.get(cv2.CAP_PROP_FPS)
-                        #                 w = int(self.vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        #                 h = int(self.vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        #             else:  # stream
-                        #                 fps, w, h = 30, im0.shape[1], im0.shape[0]
-                        #                 save_path += '.mp4'
-                        #             vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                        #         vid_writer[i].write(im0)
-
+                        if self.brightness:
+                            mask = np.full(im0.shape, (self.brightness, self.brightness, self.brightness))
+                            im0 = np.clip(im0 + mask, 0, 255).astype(np.uint8)
                         self.send_raw.emit(imr)  # 원본사진
                         self.send_img.emit(im0)  # 처리사진
                         # self.send_statistic.emit(statistic_dic)  # detecting 결과
@@ -1190,6 +1155,7 @@ class MyApp(QMainWindow):  # 메인윈도우 정의
         statusbar.addPermanentWidget(self.cent_widget.lbl_info)  # gpu info
         statusbar.addPermanentWidget(QLabel('   Copyrightⓒ2021 BIGLeader All rights reserved     '))
         statusbar.addPermanentWidget(self.cent_widget.lbl_cnt)  # file num 파일 번호
+        statusbar.setContentsMargins(0, 0, 0, 0)
         self.setGeometry(20, 50, int(0.8 * width), int(0.8 * height))  # xywh
         self.setWindowTitle('Oasis')
         self.setWindowIcon(icon)
@@ -1197,7 +1163,6 @@ class MyApp(QMainWindow):  # 메인윈도우 정의
         filemenu = QMenu("메뉴", self)
         makermenu = QMenu('제작자', self)
         menubar.addMenu(filemenu)
-        # menubar.addMenu(makermenu)
         self.sourcemenu = QAction('실행', self)
         self.sourcemenu.setShortcut('F5')
         self.sourcemenu.triggered.connect(self.cent_widget.source)
@@ -1210,17 +1175,19 @@ class MyApp(QMainWindow):  # 메인윈도우 정의
         filemenu.addAction(helpmenu)
         filemenu.aboutToShow.connect(self.signal)
         creditmenu = QAction('제작자', self)
-        # questionmenu = QAction('문의하기', self)
         makermenu.addAction(creditmenu)
         creditmenu.triggered.connect(self.credit)
-        current_version = QLabel('Oasis v' + version + '   ')
+        current_version = QLabel('Oasis v' + version + '    ')
         menubar.setCornerWidget(current_version)
         self.cent_widget.det_thread.send_info.connect(self.info)
         self.show()
         self.showMaximized()
+        QTest.qWait(100)
+        self.cent_widget.show_image(cv2.imread('./icon/main.JPG'), self.cent_widget.img)
         if not self.cent_widget.save_status:  # 캐시 파일이 존재하면
             QMessageBox.warning(self, '복원됨', '비정상 종료로 인한 데이터가 복구되었습니다.', QMessageBox.Yes)
-        self.cent_widget.source()  # 폴더 선택
+        if self.cent_widget.chk_autostart.isChecked():
+            self.cent_widget.source()  # 폴더 선택
 
     def credit(self):  # 제작자
         self.c = PaintPicture(3)  # 꺼지지 않게 변수 할당
@@ -1240,32 +1207,37 @@ class MyApp(QMainWindow):  # 메인윈도우 정의
             self.stopmenu.setEnabled(False)
 
     def stop(self):  # 쓰레드 정지함수 호출
+        self.sourcemenu.setEnabled(True)
+        self.stopmenu.setEnabled(False)
         self.cent_widget.stop()
 
-    def keyPressEvent(self, e):  # 단축키 정의
-        if e.key() == Qt.Key_F:  # press 'F' key
+    def keyPressEvent(self, e):  # set shortcut event 단축키 정의
+        if e.key() == ord(self.cent_widget.app_data['shortcut'][0]):  # press 'F' key
             self.showFullScreen()  # set app full screen
-        elif e.key() == Qt.Key_M:  # press 'M' key
+        elif e.key() == ord(self.cent_widget.app_data['shortcut'][1]):  # press 'M' key
             self.showMaximized()  # set app size to maximize
-        elif e.key() == Qt.Key_N:  # press 'N' key
+        elif e.key() == ord(self.cent_widget.app_data['shortcut'][2]):  # press 'N' key
             self.showNormal()  # set app size to normal
-        elif e.key() == Qt.Key_P:  # press 'P' key
+        elif e.key() == ord(self.cent_widget.app_data['shortcut'][3]):  # press 'P' key
             if self.cent_widget.btn_pp.isEnabled():  # if btn play/pause enable
                 self.cent_widget.btn_pp.click()  # btn play/pause click
-        elif e.key() == Qt.Key_A:  # press 'A' key
+        elif e.key() == ord(self.cent_widget.app_data['shortcut'][4]):  # press 'A' key
             if self.cent_widget.btn_prev.isEnabled():  # if btn prev enable
                 self.cent_widget.btn_prev.click()  # btn prev click
-        elif e.key() == Qt.Key_D:  # press 'D' key
+        elif e.key() == ord(self.cent_widget.app_data['shortcut'][5]):  # press 'D' key
             if self.cent_widget.btn_next.isEnabled():  # if btn next enable
                 self.cent_widget.btn_next.click()  # btn next click
-        elif e.key() == Qt.Key_S:  # press 'S' key
+        elif e.key() == ord(self.cent_widget.app_data['shortcut'][6]):  # press 'S' key
             if self.cent_widget.btn_submit.isEnabled():  # if btn submit enable
                 self.cent_widget.btn_submit.click()  # btn submit click
-        elif e.key() == Qt.Key_X:  # press 'X' key
+        elif e.key() == ord(self.cent_widget.app_data['shortcut'][7]):  # press 'X' key
             if self.cent_widget.btn_rm_file.isEnabled():
                 self.cent_widget.btn_rm_file.click()  # btn 파일삭제 click
-        elif e.key() == Qt.Key_Escape:
-            self.setFocus()
+        elif e.key() == Qt.Key_Escape:  # press 'ESC' key
+            self.setFocus()  # get focus on main window(MyApp)
+
+    def mousePressEvent(self, e):
+        self.setFocus()  # get focus on main window(MyApp)
 
     def closeEvent(self, event):  # 프로그램 종료 정의
         if not self.cent_widget.save_status:  # 상태가 저장되지 않으면
@@ -1364,12 +1336,14 @@ class PhotoViewer(QGraphicsView):
 
     def wheelEvent(self, event):
         if self.hasPhoto():
-            if event.angleDelta().y() > 0:
+            if event.angleDelta().y() > 0 and self._zoom < 15:
                 factor = 1.25
                 self._zoom += 1
-            else:
+            elif event.angleDelta().y() < 0:
                 factor = 0.8
                 self._zoom -= 1
+            else:
+                factor = 1
             if self._zoom > 0:
                 self.scale(factor, factor)
             elif self._zoom == 0:
@@ -1384,14 +1358,109 @@ class PhotoViewer(QGraphicsView):
             self.setDragMode(QGraphicsView.ScrollHandDrag)
 
     def mousePressEvent(self, event):
-        if self._photo.isUnderMouse():
-            self.photoClicked.emit(self.mapToScene(event.pos()).toPoint())
         super(PhotoViewer, self).mousePressEvent(event)
 
 
 class ReadOnlyDelegate(QStyledItemDelegate):  # table disable  셀 비활성화
     def createEditor(self, parent, option, index):
         return
+
+
+class CollapsibleBox(QWidget):
+    def __init__(self, title="", parent=None):
+        super(CollapsibleBox, self).__init__(parent)
+        self.toggle_button = QToolButton(text=title, checkable=True, checked=False)
+        self.toggle_button.setStyleSheet("QToolButton{border: none;}")
+        self.toggle_button.setFixedHeight(50)
+        big_font = QFont()
+        big_font.setPointSize(15)
+        big_font.setBold(True)
+        self.toggle_button.setFont(big_font)
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle_button.setArrowType(Qt.RightArrow)
+        self.toggle_button.pressed.connect(self.on_pressed)
+
+        self.toggle_animation = QParallelAnimationGroup(self)
+
+        self.content_area = QScrollArea(maximumHeight=0, minimumHeight=0)
+        self.content_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.content_area.setFrameShape(QFrame.NoFrame)
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(0)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.toggle_button)
+        lay.addWidget(self.content_area)
+
+        self.toggle_animation.addAnimation(QPropertyAnimation(self, b"minimumHeight"))
+        self.toggle_animation.addAnimation(QPropertyAnimation(self, b"maximumHeight"))
+        self.toggle_animation.addAnimation(QPropertyAnimation(self.content_area, b"maximumHeight"))
+
+    @pyqtSlot()
+    def on_pressed(self):
+        checked = self.toggle_button.isChecked()
+        self.toggle_button.setArrowType(Qt.DownArrow if not checked else Qt.RightArrow)
+        self.toggle_animation.setDirection(QAbstractAnimation.Forward if not checked else QAbstractAnimation.Backward)
+        self.toggle_animation.start()
+
+    def setContentLayout(self, layout):
+        # lay = self.content_area.layout()
+        # del lay
+        self.content_area.setLayout(layout)
+        collapsed_height = (self.sizeHint().height() - self.content_area.maximumHeight())
+        content_height = layout.sizeHint().height()
+        for i in range(self.toggle_animation.animationCount()):
+            animation = self.toggle_animation.animationAt(i)
+            animation.setDuration(0)
+            animation.setStartValue(collapsed_height)
+            animation.setEndValue(collapsed_height + content_height)
+
+        content_animation = self.toggle_animation.animationAt(self.toggle_animation.animationCount() - 1)
+        content_animation.setDuration(0)
+        content_animation.setStartValue(0)
+        content_animation.setEndValue(content_height)
+
+
+class ShortcutDialog(QDialog):
+    def __init__(self):
+        super(ShortcutDialog, self).__init__()
+        self.setWindowIcon(icon)
+        self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint)
+        self.setFixedSize(300, 120)
+
+        self.text = QLabel()
+
+        self.input = QLineEdit()
+        reg = QRegExp("[a-zA-Z]")
+        self.input.setValidator(QRegExpValidator(reg))
+
+        okButton = QPushButton('OK')
+        okButton.clicked.connect(self.oKButtonClicked)
+        cancelButton = QPushButton('Cancel')
+        cancelButton.clicked.connect(self.cancelButtonClicked)
+        hbox = QHBoxLayout()
+        hbox.addStretch(3)
+        hbox.addWidget(okButton)
+        hbox.addWidget(cancelButton)
+
+        vbox = QVBoxLayout()
+        vbox.addWidget(self.text)
+        vbox.addWidget(self.input)
+        vbox.addLayout(hbox)
+
+        self.setLayout(vbox)
+
+    def textValue(self):
+        return self.input.text().upper()
+
+    def oKButtonClicked(self):
+        self.accept()
+
+    def cancelButtonClicked(self):
+        self.reject()
+
+    def showModal(self):
+        return super().exec_()
 
 
 class CentWidget(QWidget):  # 위젯정의
@@ -1402,7 +1471,8 @@ class CentWidget(QWidget):  # 위젯정의
 
         self.det_thread = DetThread()  # 쓰레드 클래스 상속
         self.det_thread.send_raw.connect(self.mag)  # magnify  확대
-        self.det_thread.send_img.connect(lambda x: self.show_image(x, self.img2))  # im0 (np.ndarray)
+        # self.det_thread.send_img.connect(self.set_image)
+        self.det_thread.send_img.connect(lambda x: self.show_image(x, self.img))  # im0 (np.ndarray)
         self.det_thread.send_frame.connect(self.send_frame)  # current lbl_frame  현재 프레임
         self.det_thread.send_frames.connect(self.send_frames)  # 총 프레임 total lbl_frame
         self.det_thread.send_time.connect(self.filetime)  # file maketime 파일 생성시간
@@ -1410,8 +1480,8 @@ class CentWidget(QWidget):  # 위젯정의
         self.det_thread.send_cnt.connect(self.cnt)  # current file num/number of files  파일번호/총 파일개수
         self.det_thread.send_det.connect(self.animalcount)  # number of detections  개체 수
         self.det_thread.send_path.connect(self.path)  # 경로
-        self.det_thread.send_status.connect(
-            self.status)  # status (1:video is running, 2:video is stopped, 3:image  상태 (1:비디오 실행 중, 2:비디오 멈춤, 3:이미지)
+        # status (1:video is running, 2:video is stopped, 3:image  상태 (1:비디오 실행 중, 2:비디오 멈춤, 3:이미지)
+        self.det_thread.send_status.connect(self.status)
         self.det_thread.send_autocheck.connect(self.autocheck)  # best category  최빈 카테고리
         self.det_thread.send_conf.connect(self.show_conf)  # max-conf, min-conf  최대, 최소 신뢰값
         self.det_thread.send_disable.connect(self.disable)  # 버튼 비활성화
@@ -1430,8 +1500,10 @@ class CentWidget(QWidget):  # 위젯정의
             self.save_status = False
         del df
 
-        self.background_list = []
-        self.detect_list = []
+        self.background_list = deque()
+        self.detect_list = deque()
+        self.undo_list = deque(maxlen=30)
+        self.redo_list = deque()
         self.animal_db_dir = CONFIG_DIR / 'animal_db.yaml'
         self.app_data_dir = CONFIG_DIR / 'app_data.yaml'
         self.cache_dir = CONFIG_DIR / 'cache.csv'
@@ -1440,6 +1512,7 @@ class CentWidget(QWidget):  # 위젯정의
         gridmain = QGridLayout()
         gridopt = QGridLayout()
         gridtable = QGridLayout()
+        self.settings = QStackedWidget()
 
         font = QFont()
         font.setBold(True)
@@ -1452,19 +1525,18 @@ class CentWidget(QWidget):  # 위젯정의
         # source : dir
         self.lbl_source = QLabel(os.getcwd(), self)
         # self.lbl_source = QLabel('D:/project/NationalPark_upgrade/PYQT5/yolov5_master/sample')  # 고정값
-        self.lbl_source.setFont(font)
+        self.lbl_source.setFont(big_font)
         self.lbl_source.setStyleSheet('background-color: #FFFFFF')
         self.lbl_source.setStatusTip("분류/감지할 '폴더'를 설정합니다. *경로상에 한글이 들어가면 오류가 발생할 수 있음!")
         self.lbl_source.setToolTip("분류/감지할 '폴더'를 설정합니다.\n*경로상에 한글이 들어가면 오류가 발생할 수 있음!")
         self.lbl_source.setFixedHeight(60)
-        # self.lbl_source.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.lbl_source.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.btn_source = QPushButton('실행(폴더 선택)', self)
-        self.btn_source.setFont(font)
+        self.btn_source.setFont(big_font)
         self.btn_source.setStatusTip("분류/감지할 '폴더'를 설정합니다. *경로상에 한글이 들어가면 오류가 발생할 수 있음!")
         self.btn_source.setToolTip("분류/감지할 '폴더'를 설정합니다.\n*경로상에 한글이 들어가면 오류가 발생할 수 있음!")
         self.btn_source.setStyleSheet("background-image: url(./icon/background.jpg);")
         self.btn_source.setFixedHeight(60)
-        # self.btn_source.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.btn_source.clicked.connect(self.source)
 
         # imgsz : inference size (pixels)
@@ -1473,47 +1545,33 @@ class CentWidget(QWidget):  # 위젯정의
         self.lbl_imgsz.setStyleSheet('background-color: #FFFFFF')
         self.lbl_imgsz.setStatusTip('모델이 처리할 이미지 크기를 설정합니다. 값이 높을수록 이미지당 처리시간이 증가합니다.')
         self.lbl_imgsz.setToolTip('모델이 처리할 이미지 크기를 설정합니다.\n값이 높을수록 이미지당 처리시간이 증가합니다.')
-        # btn_imgsz = QComboBox(self)
-        # btn_imgsz.setFont(font)
-        # [btn_imgsz.addItem(i) for i in ["1280", "960", "640", "480", "320", "128"]]
-        # btn_imgsz.setCurrentIndex(3)
-        # btn_imgsz.activated[str].connect(self.det_thread.imgsz_opt)
-        # btn_imgsz = QPushButton('Image Size', self)
-        # btn_imgsz.setFont(font)
-        # btn_imgsz.setStatusTip('Set inference size (pixels) 128~1280')
-        # btn_imgsz.setToolTip('Set inference size (pixels)\n128~1280')
-        # btn_imgsz.clicked.connect(self.imgsz)
 
         # conf_thres : confidence threshold
         self.lbl_conf = QLabel(self)
-        self.lbl_conf.setText('65%')
-        self.lbl_conf.setFont(font)
+        self.lbl_conf.setText(str(self.app_data['sliconf']) + '%' if 'sliconf' in self.app_data.keys() else '65%')
+        self.lbl_conf.setFont(big_font)
         self.lbl_conf.setStyleSheet('background-color: #FFFFFF')
         self.lbl_conf.setFixedHeight(60)
-        # self.lbl_conf.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         btn_conf = QPushButton('분류 정확도 임계치', self)
-        btn_conf.setFont(font)
+        btn_conf.setFont(big_font)
         btn_conf.setStatusTip('분류 정확도 임계치를 설정합니다. 해당 값 미만은 인식하지 않습니다. 21% ~ 99%')
         btn_conf.setToolTip('분류 정확도 임계치를 설정합니다. 해당 값 미만은 인식하지 않습니다.\n21% ~ 99%')
         btn_conf.setStyleSheet("background-image: url(./icon/background.jpg);")
         btn_conf.setFixedHeight(60)
-        # btn_conf.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         btn_conf.clicked.connect(self.conf)
 
         # line_thickness : bounding box thickness (pixels)
         self.lbl_ltk = QLabel(self)
-        self.lbl_ltk.setNum(2)
-        self.lbl_ltk.setFont(font)
+        self.lbl_ltk.setNum(self.app_data['ltk'] if 'ltk' in self.app_data.keys() else 2)
+        self.lbl_ltk.setFont(big_font)
         self.lbl_ltk.setStyleSheet('background-color: #FFFFFF')
         self.lbl_ltk.setFixedHeight(60)
-        # self.lbl_ltk.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         btn_ltk = QPushButton('박스 굵기', self)
-        btn_ltk.setFont(font)
+        btn_ltk.setFont(big_font)
         btn_ltk.setStatusTip('바운딩박스 굵기(픽셀값)을 설정합니다.')
         btn_ltk.setToolTip('바운딩박스 굵기(픽셀값)을 설정합니다.')
         btn_ltk.setStyleSheet("background-image: url(./icon/background.jpg);")
         btn_ltk.setFixedHeight(60)
-        # btn_ltk.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         btn_ltk.clicked.connect(self.ltk)
 
         # self.btn_start = QPushButton('Start', self)
@@ -1525,10 +1583,11 @@ class CentWidget(QWidget):  # 위젯정의
         # self.btn_stop.setEnabled(False)
         # self.btn_stop.clicked.connect(self.stop)
 
-        self.btn_prev = QPushButton('이전', self)
+        self.btn_prev = QPushButton(f'이전 ({self.app_data["shortcut"][4]})')
         self.btn_prev.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # 1211 창 크기 변경 시 버튼 크기 자동 조절
         self.btn_prev.setFont(font)
         self.btn_prev.setEnabled(False)
+        self.btn_prev.setIcon(app.style().standardIcon(QStyle.SP_MediaSeekBackward))
         self.btn_prev.setToolTip('이전 파일\n단축키:A')
         self.btn_prev.setStatusTip('이전 파일 단축키:A')
         self.btn_prev.setStyleSheet("background-image: url(./icon/background.jpg);")
@@ -1545,10 +1604,11 @@ class CentWidget(QWidget):  # 위젯정의
         self.btn_prev.clicked.connect(self.frame_reset)
         self.btn_prev.clicked.connect(self.prev)
 
-        self.btn_next = QPushButton('다음', self)
+        self.btn_next = QPushButton(f'다음 ({self.app_data["shortcut"][5]})')
         self.btn_next.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # 1211 창 크기 변경 시 버튼 크기 자동 조절
         self.btn_next.setFont(font)
         self.btn_next.setEnabled(False)
+        self.btn_next.setIcon(app.style().standardIcon(QStyle.SP_MediaSeekForward))
         self.btn_next.setStyleSheet("background-image: url(./icon/background.jpg);")
         # self.btn_next.setStyleSheet('border-image: url(./icon/next.png);')
         # self.btn_next.setStyleSheet("""QPushButton{
@@ -1565,19 +1625,16 @@ class CentWidget(QWidget):  # 위젯정의
         self.btn_next.setStatusTip('다음 파일 단축키:D')
         self.btn_next.clicked.connect(self.next)
 
+        self.img = PhotoViewer(self)
         self.img2 = QLabel()
-        self.img2.mouseDoubleClickEvent = self.magnify
-        self.img2.setToolTip('더블클릭시 확대')
-        self.img2.setStatusTip('더블클릭시 확대')
         self.img2.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.img2.setScaledContents(True)
         self.img2.setPixmap(QPixmap('./icon/main.JPG'))
-        # self.img2.setFixedSize(int(width * 2 / 3), int(height * 2 / 3))
 
         self.sliconf = QSlider(Qt.Horizontal, self)
         self.sliconf.setRange(21, 99)
         self.sliconf.setSingleStep(1)
-        self.sliconf.setValue(65)
+        self.sliconf.setValue(self.app_data['sliconf'] if 'sliconf' in self.app_data.keys() else 65)
         self.sliconf.setMinimumHeight(50)
         self.sliconf.setStyleSheet("""QSlider::groove:horizontal {
                                     height: 3px;
@@ -1632,23 +1689,29 @@ class CentWidget(QWidget):  # 위젯정의
                         logger.warning('writing cache to result table error', exc_info=e)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.setEditTriggers(QAbstractItemView.DoubleClicked)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)  # rww4
         self.table.setItemDelegateForColumn(0, ReadOnlyDelegate(self.table))  # 파일명 수정 X
         self.table.itemChanged.connect(self.df_chg)
         self.table.cellDoubleClicked.connect(self.rename2)
 
         self.sample_table = QTableWidget()  # Main tab / tableviewer
+        # table_font = QFont()
+        # table_font.setPointSize(12)
+        # self.sample_table.setFont(table_font)
+        # self.sample_table.setStyleSheet('border:none;')
         self.sample_table.setFocusPolicy(Qt.NoFocus)
         self.sample_table.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)  # 1211 창 크기 변경 시 버튼 크기 자동 조절
         self.sample_table.setRowCount(1)
         self.sample_table.setColumnCount(len(self.app_data['columns']))
         self.sample_table.setHorizontalHeaderLabels(self.app_data['columns'])
         # self.sample_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.sample_table.setEditTriggers(QAbstractItemView.DoubleClicked)
+        self.sample_table.setEditTriggers(QAbstractItemView.AllEditTriggers)  # rww1
         self.sample_table.setItemDelegateForColumn(0, ReadOnlyDelegate(self.sample_table))  # 파일명 수정 X
         self.sample_table.setStatusTip("'테이블 저장' 버튼을 눌러 현재 보이는 데이터를 기록합니다.")
         self.sample_table.setToolTip("'테이블 저장' 버튼을 눌러 현재 보이는 데이터를 기록합니다.")
         # self.sample_table.setDragDropMode(QAbstractItemView.InternalMove)
 
+        self.sample_table.setRowHeight(0, 50)
         self.sample_table.setColumnWidth(0, 70)  # 파일명
         self.sample_table.setColumnWidth(1, 35)  # 년
         for idx in range(2, 6):  # 월,일,시간,분
@@ -1666,7 +1729,7 @@ class CentWidget(QWidget):  # 위젯정의
         self.sample_table.cellChanged.connect(self.set_animal2)
         self.sample_table.setItem(0, 7, QTableWidgetItem('미동정'))
 
-        self.btn_submit = QPushButton('테이블 저장', self)  # Main tab / Save button
+        self.btn_submit = QPushButton(f'기록 ({self.app_data["shortcut"][6]})')  # Main tab / Save button
         self.btn_submit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # 1211 창 크기 변경 시 버튼 크기 자동 조절
         self.btn_submit.setFont(font)
         self.btn_submit.setEnabled(False)
@@ -1674,6 +1737,7 @@ class CentWidget(QWidget):  # 위젯정의
         self.btn_submit.setToolTip("클릭 시 데이터를 기록합니다.\n단축키:S")
         self.btn_submit.clicked.connect(self.submit)
         self.btn_submit.setStyleSheet("background-image: url(./icon/background.jpg);")
+        self.btn_submit.setIcon(QIcon(app.style().standardIcon(QStyle.SP_DialogApplyButton)))
         # self.btn_submit.setStyleSheet("""QPushButton{
         #                 background-image: url('./icon/background.jpg');
         #                 border-style: inset;
@@ -1684,14 +1748,6 @@ class CentWidget(QWidget):  # 위젯정의
         #                 QPushButton:pressed {
         #                 background-color: rgb(250, 250, 250);
         #                 border-style: outset;}""")
-
-        self.btn_export = QPushButton('엑셀로 저장', self)  # Result tab / Data to excel
-        self.btn_export.setFont(font)
-        self.btn_export.setStatusTip('결과물을 xlsx파일로 저장합니다.')
-        self.btn_export.setToolTip('결과물을 xlsx파일로 저장합니다.')
-        self.btn_export.clicked.connect(self.save_df)
-        self.btn_export.setStyleSheet("background-image: url(./icon/background.jpg);")
-        self.btn_export.setFixedHeight(30)
 
         self.btn_add = QPushButton('칼럼 추가', self)  # Result tab / add column button
         self.btn_add.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # 1211 창 크기 변경 시 버튼 크기 자동 조절
@@ -1728,17 +1784,20 @@ class CentWidget(QWidget):  # 위젯정의
         #         QPushButton:pressed {
         #         background-color: rgb(250, 250, 250);
         #         border-style: outset;}""")
-
+        # rww0
         self.btn_pp = QPushButton(self)  # Main tab / video play/pause button
+        self.btn_pp.setText(f'재생/정지({self.app_data["shortcut"][3]})')
         self.btn_pp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # 1211 창 크기 변경 시 버튼 크기 자동 조절
         self.btn_pp.setCheckable(True)
         self.btn_pp.setChecked(False)
         self.btn_pp.setEnabled(False)
-        self.btn_pp.setStyleSheet("background-image: url(./icon/background.jpg); ")
+        self.btn_pp.setStyleSheet('''QPushButton { text-align: center;
+                background-image: url(./icon/background.jpg); }''')
         # self.btn_pp.setStyleSheet("""QPushButton{
-        #                             border-image: url(./icon/play.png);}
+        #                             background-image: url('./icon/background.jpg');
+        #                             icon:
         #                             QPushButton:checked {
-        #                             border-image: url(./icon/pause.png);
+        #                             background-image: url('./icon/background.jpg');
         #                             }""")
         # self.btn_pp.setStyleSheet("""QPushButton{
         # background-image: url('./icon/background.jpg');
@@ -1752,9 +1811,12 @@ class CentWidget(QWidget):  # 위젯정의
         # border-style: outset;}""")
         icon_pp = QIcon()
         icon_pp.addPixmap(QPixmap("./icon/pause.png"), QIcon.Normal, QIcon.On)
+        # icon_pp.addPixmap(QPixmap(QIcon(app.style().standardIcon(QStyle.SP_MediaPlay))), QIcon.Normal, QIcon.On)
         icon_pp.addPixmap(QPixmap("./icon/play.png"), QIcon.Active, QIcon.Off)
         icon_pp.addPixmap(QPixmap("./icon/pause.png"), QIcon.Active, QIcon.On)
         self.btn_pp.setIcon(icon_pp)
+        # self.btn_pp.setIconSize(QSize(20, 20))
+        self.btn_pp.setFont(font)  # rww0
         self.btn_pp.setStatusTip('재생 / 정지 단축키:P')
         self.btn_pp.setToolTip('재생 / 정지\n단축키:P')
         self.btn_pp.clicked.connect(self.pp)
@@ -1764,6 +1826,8 @@ class CentWidget(QWidget):  # 위젯정의
         self.timebox.setSuffix(" H")
         self.timebox.setValue(0)
         self.timebox.valueChanged.connect(self.edit_time)
+        self.timebox.setStatusTip('시간 불일치시 조절하세요')
+        self.timebox.setToolTip('시간 불일치시 조절하세요')
 
         self.lbl_frame = QLabel('1/0', self)  # Main tab / Show lbl_frame
         self.lbl_frame.setAlignment(Qt.AlignCenter)
@@ -1782,21 +1846,23 @@ class CentWidget(QWidget):  # 위젯정의
         speed_opt.activated[str].connect(self.det_thread.speed_slow)
         speed_opt.setStyleSheet("background-image: url(./icon/background.jpg);")
 
-        self.lbl_cnt = QLabel()  # Status bar / progress
-        self.lbl_cnt.setStatusTip('더블클릭시 이미지/영상을 이동합니다.')
-        self.lbl_cnt.setToolTip('더블클릭시 이미지/영상을 이동합니다.')
-        self.lbl_cnt.setFixedWidth(80)
-        self.lbl_cnt.mouseDoubleClickEvent = self.move_file
+        self.lbl_cnt = QPushButton()  # Status bar / progress
+        self.lbl_cnt.setStatusTip('클릭시 이미지/영상을 이동합니다.')
+        self.lbl_cnt.setToolTip('클릭시 이미지/영상을 이동합니다.')
+        self.lbl_cnt.setFixedWidth(100)
+        self.lbl_cnt.setIcon(QIcon(app.style().standardIcon(QStyle.SP_FileDialogContentsView)))
+        # self.lbl_cnt.setAlignment(Qt.AlignCenter)
+        # self.lbl_cnt.setIcon(app.style().standardIcon(QStyle.SP_MediaPlay))
+        # self.lbl_cnt.setPixmap(QPixmap('./icon/play.png'))
+        # self.lbl_cnt.setStyleSheet('''border-image: url(./icon/logo3.png);
+        #                             border: none;
+        #                             height: 1px;
+        #                             width: 1px;
+        #                             padding: 2 2 2 20;''')
+        # self.lbl_cnt.mouseDoubleClickEvent = self.move_file
+        self.lbl_cnt.clicked.connect(self.move_file)
 
-        self.lbl_info = QLabel()
-
-        btn_rm = QPushButton('데이터 제거', self)
-        btn_rm.setFont(font)
-        btn_rm.setStatusTip('원하는 데이터(행)을 제거합니다.')
-        btn_rm.setToolTip('원하는 데이터(행)을 제거합니다.')
-        btn_rm.clicked.connect(self.rm_data)
-        btn_rm.setStyleSheet("background-image: url(./icon/background.jpg);")
-        btn_rm.setFixedHeight(30)
+        self.lbl_info = QLabel()  # gpu 정보
 
         self.btn_add_li = QPushButton('간편 목록 추가')
         self.btn_add_li.clicked.connect(self.add_ani)
@@ -1815,10 +1881,10 @@ class CentWidget(QWidget):  # 위젯정의
         self.btn_add_li.setToolTip('국명을 리스트에 추가합니다.')
         self.btn_add_li.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # 1211 창 크기 변경 시 버튼 크기 자동 조절
         self.btn_add_li.setFont(font)
-        self.btn_rm_file = QPushButton('파일 제거')
+        self.btn_rm_file = QPushButton(f'파일 제거 ({self.app_data["shortcut"][7]})')
         self.btn_rm_file.clicked.connect(self.erase_file)
         self.btn_rm_file.setEnabled(False)
-        self.btn_rm_file.setStyleSheet("background-color: #FF0000")
+        self.btn_rm_file.setStyleSheet("background-color: #FF3333")
         # self.btn_rm_file.setStyleSheet("""QPushButton{
         #                 background-image: url('./icon/background.jpg');
         #                 border-style: outset;
@@ -1829,13 +1895,13 @@ class CentWidget(QWidget):  # 위젯정의
         #                 QPushButton:pressed {
         #                 border-color: rgb(255, 255, 255);
         #                 border-style: inset;}""")
-        self.btn_rm_file.setStatusTip('현재 파일을 제거합니다. 단축키:X')
-        self.btn_rm_file.setToolTip('현재 파일을 제거합니다.\n단축키:X')
+        self.btn_rm_file.setStatusTip('현재 파일을 제거합니다. 제거된 파일은 현재경로의 trash폴더에 저장됩니다. 단축키:X')
+        self.btn_rm_file.setToolTip('현재 파일을 제거합니다.\n제거된 파일은 현재경로의 trash폴더에 저장됩니다.\n단축키:X')
         self.btn_rm_file.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # 1211 창 크기 변경 시 버튼 크기 자동 조절
         self.btn_rm_file.setFont(font)
 
         logo = QLabel()
-        logo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        logo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         logo.setScaledContents(True)
         bigleader = QPixmap('./icon/bigleader.png')
         bigleader = bigleader.scaled(300, 80, Qt.KeepAspectRatio)
@@ -1852,42 +1918,94 @@ class CentWidget(QWidget):  # 위젯정의
         self.chk_hlbl.setStatusTip('체크시 처리된 영상이 분류된 동물 이름을 띄우지 않습니다.')
         self.chk_hlbl.setToolTip('체크시 처리된 영상이 분류된 동물 이름을 띄우지 않습니다.')
         self.chk_hlbl.stateChanged.connect(self.hlbl)
-        self.chk_hlbl.setFont(font)
+        self.chk_hlbl.setFont(big_font)
+        self.chk_hlbl.setChecked(self.app_data['hlbl'] if 'hlbl' in self.app_data.keys() else False)
         self.chk_hconf = QCheckBox('분류 정확도 숨김')
-        self.chk_hconf.setChecked(True)
         self.chk_hconf.setStatusTip('체크시 처리된 영상이 신뢰도값을 띄우지 않습니다.')
         self.chk_hconf.setToolTip('체크시 처리된 영상이 신뢰도값을 띄우지 않습니다.')
         self.chk_hconf.stateChanged.connect(self.hconf)
-        self.chk_hconf.setFont(font)
+        self.chk_hconf.setFont(big_font)
+        self.chk_hconf.setChecked(self.app_data['hconf'] if 'hconf' in self.app_data.keys() else True)
         self.chk_unknown = QCheckBox('Unknown')
         self.chk_unknown.setStatusTip('체크시 신뢰도값이 0.2보다 크고 설정된 신뢰도 하한값 보다 작으면 unknown으로 라벨링 합니다.')
         self.chk_unknown.setToolTip('체크시 신뢰도값이 0.2보다 크고 설정된 신뢰도 하한값 보다 작으면 unknown으로 라벨링 합니다.')
         self.chk_unknown.stateChanged.connect(self.unknown)
-        self.chk_unknown.setFont(font)
+        self.chk_unknown.setFont(big_font)
+        self.chk_unknown.setChecked(self.app_data['unknown'] if 'unknown' in self.app_data.keys() else False)
         self.chk_device = QCheckBox('CPU 사용')
         self.chk_device.setStatusTip('체크시 딥러닝 장치로 CPU를 사용합니다.')
         self.chk_device.setToolTip('체크시 딥러닝 장치로 CPU를 사용합니다.')
         self.chk_device.setFont(font)
+        self.chk_device.setChecked(self.app_data['device'] if 'device' in self.app_data.keys() else False)
         self.chk_autorename = QCheckBox('자동 이름 변경')
         self.chk_autorename.setStatusTip('체크시 테이블 저장시에 자동으로 파일이름을 "현재파일이름_동물명" 으로 변경합니다.')
         self.chk_autorename.setToolTip('체크시 테이블 저장시에 자동으로 파일이름을 "현재파일이름_동물명" 으로 변경합니다.')
-        self.chk_autorename.setFont(font)
+        self.chk_autorename.setFont(big_font)
+        self.chk_autorename.setChecked(self.app_data['autorename'] if 'autorename' in self.app_data.keys() else False)
+        self.chk_autostart = QCheckBox('프로그램 실행 시 자동시작')
+        self.chk_autostart.setStatusTip('체크시 프로그램 실행과 동시에 폴더 선택창이 나타납니다.')
+        self.chk_autostart.setToolTip('체크시 프로그램 실행과 동시에 폴더 선택창이 나타납니다.')
+        self.chk_autostart.setFont(big_font)
+        self.chk_autostart.setChecked(self.app_data['autostart'] if 'autostart' in self.app_data.keys() else True)
+        self.chk_editmode = QCheckBox('더블클릭으로 테이블 수정')
+        self.chk_editmode.setStatusTip('체크시 테이블을 더블클릭해야 수정됩니다.')
+        self.chk_editmode.setToolTip('체크시 테이블을 더블클릭해야 수정됩니다.')
+        self.chk_editmode.stateChanged.connect(self.tableEditMode)
+        self.chk_editmode.setFont(big_font)
+        self.chk_editmode.setChecked(self.app_data['editmode'] if 'editmode' in self.app_data.keys() else False)
+
+        btn_rm = QPushButton('데이터 제거', self)
+        btn_rm.setFont(big_font)
+        btn_rm.setStatusTip('원하는 데이터(행)을 제거합니다.')
+        btn_rm.setToolTip('원하는 데이터(행)을 제거합니다.')
+        btn_rm.clicked.connect(self.rm_data)
+        btn_rm.setStyleSheet("background-image: url(./icon/background.jpg);")
+        btn_rm.setFixedHeight(50)
+        btn_rm.setIcon(QIcon(app.style().standardIcon(QStyle.SP_DialogResetButton)))
 
         self.btn_clear = QPushButton('초기화')
-        self.btn_clear.setFont(font)
+        self.btn_clear.setFont(big_font)
         self.btn_clear.setStyleSheet("background-image: url(./icon/background.jpg);")
         self.btn_clear.setStatusTip('테이블을 초기화합니다.')
         self.btn_clear.setToolTip('테이블을 초기화합니다.')
         self.btn_clear.clicked.connect(self.clear)
-        self.btn_clear.setFixedHeight(30)
+        self.btn_clear.setFixedHeight(50)
+        self.btn_clear.setIcon(QIcon(app.style().standardIcon(QStyle.SP_MessageBoxCritical)))
 
         self.btn_search = QPushButton('파일번호 검색')
-        self.btn_search.setFont(font)
+        self.btn_search.setFont(big_font)
         self.btn_search.setStyleSheet("background-image: url(./icon/background.jpg);")
         self.btn_search.setStatusTip('파일이름이 몇 번째 파일인지 검색합니다.')
         self.btn_search.setToolTip('파일이름이 몇 번째 파일인지 검색합니다.')
+        self.btn_search.setFixedHeight(50)
+        self.btn_search.setIcon(QIcon(app.style().standardIcon(QStyle.SP_FileDialogContentsView)))
         self.btn_search.clicked.connect(self.search)
-        self.btn_search.setFixedHeight(30)
+
+        self.btn_export = QPushButton('엑셀로 저장', self)  # Result tab / Data to excel
+        self.btn_export.setFont(big_font)
+        self.btn_export.setStatusTip('결과물을 xlsx파일로 저장합니다.')
+        self.btn_export.setToolTip('결과물을 xlsx파일로 저장합니다.')
+        self.btn_export.clicked.connect(self.save_df)
+        self.btn_export.setStyleSheet("background-image: url(./icon/background.jpg);")
+        self.btn_export.setIcon(QIcon(app.style().standardIcon(QStyle.SP_DialogSaveButton)))
+        self.btn_export.setFixedHeight(50)
+
+        self.btn_undo = QPushButton('실행 취소')
+        self.btn_undo.setFont(big_font)
+        self.btn_undo.setEnabled(False)
+        self.btn_undo.setIcon(app.style().standardIcon(QStyle.SP_ArrowLeft))
+        # self.btn_undo.setIconSize(QSize(15, 15))
+        self.btn_undo.setStyleSheet("background-image: url(./icon/background.jpg);")
+        self.btn_undo.setFixedHeight(50)
+        self.btn_undo.clicked.connect(self.undo)
+
+        self.btn_redo = QPushButton('다시 실행')
+        self.btn_redo.setFont(big_font)
+        self.btn_redo.setEnabled(False)
+        self.btn_redo.setIcon(app.style().standardIcon(QStyle.SP_ArrowRight))
+        self.btn_redo.setStyleSheet("background-image: url(./icon/background.jpg);")
+        self.btn_redo.setFixedHeight(50)
+        self.btn_redo.clicked.connect(self.redo)
 
         self.list_animal = QListWidget()
         self.list_animal.setFont(big_font)
@@ -1920,54 +2038,263 @@ class CentWidget(QWidget):  # 위젯정의
         self.btn_animal_lock.setCheckable(True)
         self.btn_animal_lock.setChecked(False)
         self.btn_animal_lock.setIcon(icon_lock)
+        self.btn_animal_lock.setIconSize(QSize(30, 30))
         self.btn_animal_lock.clicked.connect(self.animal_lock)
         self.btn_animal_lock.setStyleSheet("background-color:#FFFFFF")
         self.btn_animal_lock.setToolTip("체크시 동물목록을 드래그&드롭으로 위치변경 및 삭제 가능")
         self.btn_animal_lock.setStatusTip("체크시 동물목록을 드래그&드롭으로 위치변경 및 삭제 가능")
 
+        icon_settings = QIcon()
+        # icon_settings.addPixmap(QPixmap("./icon/settings.png"))
+        icon_settings.addPixmap(QPixmap("./icon/logo2.png"))
+        btn_edit_animal = QPushButton()
+        # btn_edit_animal.setEnabled(False)
+        # btn_edit_animal.setStyleSheet("background-image: url(./icon/background.jpg);")
+        btn_edit_animal.setStyleSheet('QPushButton{border:none;}')
+        # btn_edit_animal.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        btn_edit_animal.setIconSize(QSize(30, 30))
+        btn_edit_animal.setIcon(icon_settings)
+        # btn_edit_animal = QLabel()
+        # btn_edit_animal.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        # rattle = QPixmap("./icon/logo2.png")
+        # btn_edit_animal.setPixmap(rattle)
+        # btn_edit_animal.setScaledContents(True)
+        # btn_edit_animal.setFixedSize(QSize(30, 30))
+        # btn_edit_animal.setStyleSheet('''QLabel {background-color:#000000}''')
+        # btn_edit_animal.setAlignment(Qt.AlignCenter)
+        # btn_edit_animal.setText('kkkkkkkkkkkk')
+
+        btn_bright = QPushButton(self)
+        btn_bright.setIcon(QIcon(QPixmap('./icon/bright.png')))
+        btn_bright.setStyleSheet("background-image: url(./icon/background.jpg);")
+        btn_bright.clicked.connect(self.bright)
+        btn_dark = QPushButton(self)
+        btn_dark.setStyleSheet("background-image: url(./icon/background.jpg);")
+        btn_dark.setIcon(QIcon(QPixmap('./icon/dark.png')))
+        btn_dark.clicked.connect(self.dark)
+        self.lbl_bright = QLabel('0')
+        self.lbl_bright.setAlignment(Qt.AlignCenter)
+
+        lbl_log = QLabel()
+        lbl_log.setText('로그파일 위치 : ' + str(CONFIG_DIR / 'logs'))
+        lbl_log.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lbl_log.setFont(big_font)
+
+        self.lbl_trash = QLabel()
+        self.lbl_trash.setText('제거파일 위치 : ')
+        self.lbl_trash.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_trash.setFont(big_font)
+
+        self.btn_save = QPushButton('옵션 저장')
+        self.btn_save.setToolTip("현재 옵션 상태를 저장합니다")
+        self.btn_save.setStatusTip("현재 옵션 상태를 저장합니다")
+        self.btn_save.setFixedHeight(60)
+        self.btn_save.setFont(big_font)
+        self.btn_save.setStyleSheet("background-image: url(./icon/background.jpg);")
+        self.btn_save.setIcon(QIcon(app.style().standardIcon(QStyle.SP_DialogSaveButton)))
+        self.btn_save.clicked.connect(self.save_options)
+
+        self.mainBtns = []
+        self.mainBtns.append(self.btn_pp)
+        self.mainBtns.append(self.btn_prev)
+        self.mainBtns.append(self.btn_next)
+        self.mainBtns.append(self.btn_submit)
+        self.mainBtns.append(self.btn_rm_file)
+
         # girdmain
-        gridmain.addWidget(self.img2, 0, 0, 80, 76)
-        gridmain.addWidget(logo, 0, 76, 10, 24)
-        gridmain.addWidget(self.btn_add_li, 10, 76, 5, 10)
-        gridmain.addWidget(self.btn_animal_lock, 10, 96, 5, 4)
-        gridmain.addWidget(self.list_animal, 15, 76, 70, 24)  # 동물그룹
-        gridmain.addWidget(self.timebox, 80, 0, 5, 2)
-        gridmain.addWidget(self.lbl_frame, 80, 2, 5, 6)
-        gridmain.addWidget(self.sliframe, 80, 8, 5, 60)
-        gridmain.addWidget(self.btn_submit, 85, 84, 7, 8)  # 테이블 저장
-        gridmain.addWidget(self.btn_rm_file, 85, 92, 7, 8)
-        gridmain.addWidget(speed_opt, 80, 68, 5, 8)  # 속도조절
-        gridmain.addWidget(self.noon_night(), 85, 76, 7, 8)  # 주간/야간 버튼
-        gridmain.addWidget(self.btn_prev, 92, 76, 7, 8)  # 이전
-        gridmain.addWidget(self.btn_next, 92, 92, 7, 8)  # 다음
-        gridmain.addWidget(self.btn_pp, 92, 84, 7, 8)  # 재생/정지 버튼
-        gridmain.addWidget(self.sample_table, 85, 0, 14, 60)  #
-        gridmain.addWidget(self.btn_add, 85, 60, 7, 8)  # 1211
-        gridmain.addWidget(self.btn_remove, 92, 60, 7, 8)  #
-        gridmain.addWidget(self.temperature(), 85, 68, 14, 8)  # 온도
+        gridmain.addWidget(self.img, 0, 0, 81, 84)  # 사진
+        gridmain.addWidget(logo, 0, 84, 10, 16)  # 빅리더 로고
+        gridmain.addWidget(self.btn_add_li, 10, 88, 5, 8)  # 간편 목록 추가
+        gridmain.addWidget(btn_edit_animal, 10, 84, 5, 4)  # 톱니
+        gridmain.addWidget(self.btn_animal_lock, 10, 96, 5, 4)  # 리스트 잠금버튼
+        gridmain.addWidget(self.list_animal, 15, 84, 71, 16)  # 동물리스트
+        gridmain.addWidget(self.timebox, 81, 0, 5, 2)
+        gridmain.addWidget(self.lbl_frame, 81, 2, 5, 6)
+        gridmain.addWidget(self.sliframe, 81, 8, 5, 60)
+        gridmain.addWidget(self.btn_submit, 86, 84, 7, 8)  # 기록
+        gridmain.addWidget(self.btn_rm_file, 86, 92, 7, 8)
+        gridmain.addWidget(speed_opt, 81, 68, 5, 8)  # 속도조절
+        gridmain.addWidget(self.noon_night(), 86, 76, 7, 8)  # 주간/야간 버튼
+        gridmain.addWidget(self.btn_prev, 93, 76, 7, 8)  # 이전
+        gridmain.addWidget(self.btn_next, 93, 92, 7, 8)  # 다음
+        gridmain.addWidget(self.btn_pp, 93, 84, 7, 8)  # 재생/정지 버튼
+        gridmain.addWidget(self.sample_table, 86, 0, 14, 60)  #
+        gridmain.addWidget(self.btn_add, 86, 60, 7, 8)  # 1211
+        gridmain.addWidget(self.btn_remove, 93, 60, 7, 8)  #
+        gridmain.addWidget(self.temperature(), 86, 68, 14, 8)  # 온도
+        gridmain.addWidget(btn_dark, 81, 76, 5, 3)
+        gridmain.addWidget(self.lbl_bright, 81, 79, 5, 2)
+        gridmain.addWidget(btn_bright, 81, 81, 5, 3)
 
         # gridopt
-        gridopt.addWidget(self.btn_source, 0, 0, 1, 5)
-        gridopt.addWidget(self.lbl_source, 0, 5, 1, 10)
-        gridopt.addWidget(btn_conf, 1, 0, 1, 5)
-        gridopt.addWidget(self.lbl_conf, 1, 5, 1, 3)
-        gridopt.addWidget(self.sliconf, 1, 8, 1, 12)
-        gridopt.addWidget(btn_ltk, 2, 0, 1, 5)
-        gridopt.addWidget(self.lbl_ltk, 2, 5, 1, 2)
-        gridopt.addWidget(self.chk_hlbl, 4, 0, 1, 5)
-        gridopt.addWidget(self.chk_hconf, 5, 0, 1, 5)
-        gridopt.addWidget(self.chk_unknown, 6, 0, 1, 5)
-        gridopt.addWidget(self.imgsz(), 3, 0, 1, 5)
-        gridopt.addWidget(self.weights(), 3, 7, 1, 5)
-        gridopt.addWidget(self.autogroup(), 4, 7, 3, 5)
-        gridopt.addWidget(self.chk_autorename, 3, 14, 1, 4)
+        # gridopt.setContentsMargins(50, 0, 50, 0)
+        # gridopt.addWidget(self.btn_source, 0, 0, 10, 5)
+        # gridopt.addWidget(self.lbl_source, 0, 5, 10, 10)
+        # gridopt.addWidget(btn_conf, 15, 0, 10, 5)
+        # gridopt.addWidget(self.lbl_conf, 15, 5, 10, 3)
+        # gridopt.addWidget(self.sliconf, 15, 7, 10, 12)
+        # gridopt.addWidget(btn_ltk, 30, 0, 10, 5)
+        # gridopt.addWidget(self.lbl_ltk, 30, 5, 10, 2)
+        # gridopt.addWidget(self.chk_hlbl, 60, 0, 10, 3)  # 동물 이름 숨김
+        # gridopt.addWidget(self.chk_hconf, 75, 0, 10, 3)  # 분류 정확도 숨김
+        # gridopt.addWidget(self.chk_unknown, 90, 0, 10, 3)  # unknown
+        # gridopt.addWidget(self.chk_editmode, 60, 3, 10, 3)  # 더블클릭으로 테이블 수정 #rww1
+        # gridopt.addWidget(self.chk_autorename, 75, 3, 10, 3)  # 파일명 자동변경
+        # gridopt.addWidget(self.chk_autostart, 90, 3, 10, 3)  # 실행 시 자동시작
+        # gridopt.addWidget(self.imgsz(), 45, 0, 10, 5)  # 사진 분할 개수
+        # gridopt.addWidget(self.weights(), 45, 7, 10, 5)  # 모델
+        # gridopt.addWidget(self.autogroup(), 45, 14, 10, 5)  # 모드 변경
+        # gridopt.addWidget(lbl_log, 90, 7, 10, 12)
+        # gridopt.addWidget(self.btn_save, 90, 16, 10, 3)  # 옵션 저장
+        settingsAI = QWidget()
+        settingsAI.setContentsMargins(50, 0, 20, 0)
+        gridAI = QGridLayout()
+        gridAI.addWidget(self.btn_source, 0, 0, 10, 5)
+        gridAI.addWidget(self.lbl_source, 0, 5, 10, 15)
+        gridAI.addWidget(btn_conf, 15, 0, 10, 5)
+        gridAI.addWidget(self.lbl_conf, 15, 6, 10, 2)
+        gridAI.addWidget(self.sliconf, 15, 7, 10, 13)
+        gridAI.addWidget(btn_ltk, 30, 0, 10, 5)
+        gridAI.addWidget(self.lbl_ltk, 30, 6, 10, 2)
+        gridAI.addWidget(self.imgsz(), 45, 9, 10, 6)  # 사진 분할 개수
+        gridAI.addWidget(self.weights(), 60, 9, 10, 6)  # 모델
+        gridAI.addWidget(self.autogroup(), 75, 9, 10, 6)  # 모드 변경
+        gridAI.addWidget(self.chk_hlbl, 45, 1, 10, 5)  # 동물 이름 숨김
+        gridAI.addWidget(self.chk_hconf, 60, 1, 10, 5)  # 분류 정확도 숨김
+        gridAI.addWidget(self.chk_unknown, 75, 1, 10, 5)  # unknown
+        settingsAI.setLayout(gridAI)
+        self.settings.addWidget(settingsAI)
+
+        settingsAPP = QWidget()
+        settingsAPP.setContentsMargins(50, 50, 50, 50)
+        gridAPP = QGridLayout()
+        gridAPP.addWidget(self.chk_editmode, 0, 0, 10, 7)  # 더블클릭으로 테이블 수정 #rww1
+        gridAPP.addWidget(self.chk_autorename, 10, 0, 10, 7)  # 파일명 자동변경
+        gridAPP.addWidget(self.chk_autostart, 20, 0, 10, 7)  # 실행 시 자동시작
+        gridAPP.addWidget(self.lbl_trash, 30, 0, 10, 20)  # 삭제파일 위치
+        gridAPP.addWidget(lbl_log, 40, 0, 10, 20)  # 로그파일 위치
+        gridAPP.addWidget(self.shortcutbox(), 3, 7, 24, 13)
+        settingsAPP.setLayout(gridAPP)
+        self.settings.addWidget(settingsAPP)
+
+        # ================================ FAQ ==========================================================
+        # 내용이 많아질 경우 도킹위젯으로 변경할 것.
+        # settingsFAQ = QDockWidget()
+        # scroll = QScrollArea()
+        # settingsFAQ.setWidget(scroll)
+        # content = QWidget()
+        # scroll.setWidget(content)
+        # scroll.setWidgetResizable(True)
+        # layFAQ = QVBoxLayout(content)
+        settingsFAQ = QWidget()
+        layFAQ = QVBoxLayout()
+
+        question1 = CollapsibleBox('프로그램이 갑자기 종료되었어요 / 오류가 발생했다는 메세지가 나와요')
+        # question1.setFixedHeight(100)
+        question1.setFont(big_font)
+        lay1 = QVBoxLayout()
+        answer1 = QLabel('죄송합니다. 저희가 개발과정에서 미처 인지하지 못한 오류입니다.\n'
+                         '프로그램 설정 탭에서 로그파일 위치를 확인하여 해당 로그와 함께 문의해주시면 최대한 빠르게 수정하겠습니다.')
+        answer1.setFixedHeight(50)
+        answer1.setFont(big_font)
+        lay1.addWidget(answer1)
+        question1.setContentLayout(lay1)
+        layFAQ.addWidget(question1)
+
+        question2 = CollapsibleBox('파일을 일일이 넘기지 않고 한번에 원하는 곳으로 이동할 수 있나요?')
+        # question2.setFixedHeight(100)
+        question2.setFont(big_font)
+        lay2 = QVBoxLayout()
+        answer2 = QLabel('메인 탭에서 우측 하단의 현재파일번호/전체파일개수 버튼을 클릭하시면 이동 가능합니다.')
+        answer2.setFixedHeight(50)
+        answer2.setFont(big_font)
+        lay2.addWidget(answer2)
+        question2.setContentLayout(lay2)
+        layFAQ.addWidget(question2)
+
+        question3 = CollapsibleBox('특정 파일을 확인하고 싶은데 번호를 모르겠어요')
+        # question3.setFixedHeight(100)
+        question3.setFont(big_font)
+        lay3 = QVBoxLayout()
+        answer3 = QLabel('Result 탭에서 "파일번호 확인" 버튼을 눌러 파일명을 입력하면 파일번호를 얻을 수 있습니다.')
+        answer3.setFixedHeight(50)
+        answer3.setFont(big_font)
+        lay3.addWidget(answer3)
+        question3.setContentLayout(lay3)
+        layFAQ.addWidget(question3)
+
+        question4 = CollapsibleBox('제거된 파일이 휴지통에서 보이지 않아요')
+        # question4.setFixedHeight(100)
+        question4.setFont(big_font)
+        lay4 = QVBoxLayout()
+        answer4 = QLabel('"파일 제거" 버튼을 통해 임시로 지워진 사진 및 영상은\n실행 시 적용한 폴더 경로에 새로 만들어진'
+                         '"trash" 폴더로 이동하게 됩니다.')
+        answer4.setFixedHeight(50)
+        answer4.setFont(big_font)
+        lay4.addWidget(answer4)
+        question4.setContentLayout(lay4)
+        layFAQ.addWidget(question4)
+
+        question5 = CollapsibleBox('동물 리스트를 삭제하고 싶어요')
+        # question5.setFixedHeight(100)
+        question5.setFont(big_font)
+        lay5 = QVBoxLayout()
+        answer5 = QLabel('자물쇠 버튼을 눌러 편집가능 형태로 만든 뒤, 지우고 싶은 동물 리스트를 더블클릭 하면 제거할 수 있습니다.')
+        answer5.setFixedHeight(50)
+        answer5.setFont(big_font)
+        lay5.addWidget(answer5)
+        question5.setContentLayout(lay5)
+        layFAQ.addWidget(question5)
+
+        layFAQ.addStretch()
+        settingsFAQ.setLayout(layFAQ)
+        self.settings.addWidget(settingsFAQ)
+        # ================================= End FAQ =========================================
+
+        scrollPatch = QScrollArea()
+        scrollPatch.setStyleSheet('background-color:#FFFFFF;')
+        try:
+            with open('Patchnote.txt', 'r', encoding='utf-8') as f:
+                patchnote = f.read()
+        except FileNotFoundError:
+            patchnote = ''
+        lbl_patchnote = QLabel(patchnote)
+        lbl_patchnote.setFont(big_font)
+        lbl_patchnote.setContentsMargins(30, 30, 30, 30)
+        scrollPatch.setWidget(lbl_patchnote)
+        self.settings.addWidget(scrollPatch)
+
+        self.settings.addWidget(self.img2)
+
+        self.list_settings = QListWidget()
+        self.list_settings.setFocusPolicy(Qt.NoFocus)
+        self.list_settings.setFont(big_font)
+        self.list_settings.setStyleSheet('''QListWidget{border: none;} QListWidget:item {height:150px;}''')
+        self.list_settings.addItem('AI 설정')
+        self.list_settings.addItem('프로그램 설정')
+        self.list_settings.addItem('자주 묻는 질문')
+        self.list_settings.addItem('패치노트')
+        self.list_settings.addItem('제작자')
+        self.list_settings.setCurrentRow(0)
+        self.list_settings.itemClicked.connect(self.setting_chg)
+
+        self.settings2 = QWidget()
+        settingsLayout = QGridLayout()
+        settingsLayout.addWidget(self.list_settings, 0, 0, 90, 10)
+        settingsLayout.addWidget(self.settings, 0, 10, 100, 90)
+        settingsLayout.addWidget(self.btn_save, 90, 0, 10, 10)  # 옵션 저장
+        # settingsLayout.setStretch(0, 1)
+        # settingsLayout.setStretch(1, 10)
+        self.settings2.setLayout(settingsLayout)
 
         # gridtable
-        gridtable.addWidget(self.btn_export, 5, 3, 1, 1)
-        gridtable.addWidget(btn_rm, 5, 2, 1, 1)
-        gridtable.addWidget(self.btn_clear, 5, 0, 1, 1)
-        gridtable.addWidget(self.btn_search, 5, 1, 1, 1)
-        gridtable.addWidget(self.table, 0, 0, 5, 4)
+        gridtable.addWidget(self.btn_undo, 0, 0, 1, 1)
+        gridtable.addWidget(self.btn_redo, 0, 1, 1, 1)
+        gridtable.addWidget(btn_rm, 0, 2, 1, 1)
+        gridtable.addWidget(self.btn_clear, 0, 3, 1, 1)
+        gridtable.addWidget(self.btn_search, 0, 4, 1, 1)
+        gridtable.addWidget(self.btn_export, 0, 5, 1, 1)
+        gridtable.addWidget(self.table, 1, 0, 5, 6)
 
         main = QWidget()
         main.setLayout(gridmain)
@@ -1981,9 +2308,107 @@ class CentWidget(QWidget):  # 위젯정의
 
         self.tabs = QTabWidget(self)
         self.tabs.setFocusPolicy(Qt.NoFocus)
+        # self.tabs.shortcut = QShortcut(QKeySequence(Qt.Key_Tab), self)
+        # self.tabs.shortcut.activated.connect(self.next_tab)
         self.tabs.addTab(main, 'Main')
-        self.tabs.addTab(self.options, 'Options')
+        self.tabs.addTab(self.settings2, 'Settings')
         self.tabs.addTab(table, 'Result')
+
+    # def next_tab(self):
+    #     index = (self.currentIndex() + 1) % self.count()
+    #     focus_widget = QApplication.focusWidget()
+    #     tab_index = focus_widget.property("tab_index") if focus_widget else None
+    #     print(tab_index)
+    #     print(index)
+    #     self.tabs.setCurrentIndex(index)
+    #     if tab_index is not None and self.currentWidget() is not None:
+    #         for widget in self.currentWidget().findChildren(QWidget):
+    #             i = widget.property("tab_index")
+    #             if i == tab_index:
+    #                 widget.setFocus(True)
+
+    def setting_chg(self, _):
+        self.settings.setCurrentIndex(self.list_settings.currentIndex().row())
+
+    def undo(self):
+        if len(self.undo_list):
+            self.redo_list.append(self.cache.copy())
+            self.btn_redo.setEnabled(True)
+            self.table.blockSignals(True)
+            self.cache = self.undo_list.pop()
+            if not len(self.undo_list):
+                self.btn_undo.setEnabled(False)
+            row, col = self.cache.shape
+            header = list(self.cache.columns)
+            self.table.setRowCount(row)
+            self.table.setColumnCount(col)
+            self.table.setHorizontalHeaderLabels(header)
+            self.sample_table.setColumnCount(col)
+            self.sample_table.setHorizontalHeaderLabels(header)
+            self.app_data['columns'] = header
+            for i in range(row):
+                for j in range(col):
+                    try:
+                        self.table.setItem(i, j, QTableWidgetItem(str(self.cache.iloc[i, j])))
+                    except Exception as e:
+                        logger.warning('writing cache to result table error', exc_info=e)
+            self.table.blockSignals(False)
+            self.btn_redo.setEnabled(True)
+            try:
+                self.cache.to_csv(self.cache_dir, index=False)
+                with open(self.app_data_dir, 'w', encoding='utf-8') as file:
+                    yaml.dump(self.app_data, file)
+            except (OSError, PermissionError) as e:
+                QMessageBox.warning(self, '저장 실패', '임시저장에 실패하였습니다.')
+                logger.warning('save cache error "def undo"', exc_info=e)
+
+    def redo(self):
+        if len(self.redo_list):
+            self.undo_list.append(self.cache.copy())
+            self.btn_undo.setEnabled(True)
+            self.table.blockSignals(True)
+            self.cache = self.redo_list.pop()
+            if not len(self.redo_list):
+                self.btn_redo.setEnabled(False)
+            row, col = self.cache.shape
+            header = list(self.cache.columns)
+            self.table.setRowCount(row)
+            self.table.setColumnCount(col)
+            self.table.setHorizontalHeaderLabels(header)
+            self.sample_table.setColumnCount(col)
+            self.sample_table.setHorizontalHeaderLabels(header)
+            self.app_data['columns'] = header
+            for i in range(row):
+                for j in range(col):
+                    try:
+                        self.table.setItem(i, j, QTableWidgetItem(str(self.cache.iloc[i, j])))
+                    except Exception as e:
+                        logger.warning('writing cache to result table error', exc_info=e)
+            self.table.blockSignals(False)
+            try:
+                self.cache.to_csv(self.cache_dir, index=False)
+                with open(self.app_data_dir, 'w', encoding='utf-8') as file:
+                    yaml.dump(self.app_data, file)
+            except (OSError, PermissionError) as e:
+                QMessageBox.warning(self, '저장 실패', '임시저장에 실패하였습니다.')
+                logger.warning('save cache error "def undo"', exc_info=e)
+
+    def save_options(self):
+        self.btn_save.setEnabled(False)
+        self.app_data['weight'] = self.btn_weights.currentIndex()
+        self.app_data['sliconf'] = int(self.sliconf.value())
+        self.app_data['ltk'] = int(self.lbl_ltk.text())
+        self.app_data['hlbl'] = self.chk_hlbl.isChecked()
+        self.app_data['hconf'] = self.chk_hconf.isChecked()
+        self.app_data['unknown'] = self.chk_unknown.isChecked()
+        self.app_data['device'] = self.chk_device.isChecked()
+        self.app_data['autorename'] = self.chk_autorename.isChecked()
+        self.app_data['autostart'] = self.chk_autostart.isChecked()
+        self.app_data['editmode'] = self.chk_editmode.isChecked()
+        with open(self.app_data_dir, 'w', encoding='utf-8') as f:
+            yaml.dump(self.app_data, f)
+        QTest.qWait(1000)
+        self.btn_save.setEnabled(True)
 
     def prev(self):
         self.det_thread.prev()
@@ -1991,6 +2416,20 @@ class CentWidget(QWidget):  # 위젯정의
     def next(self):
         self.btn_next.setEnabled(False)
         self.det_thread.next()
+
+    def bright(self):  # brightly image
+        if self.det_thread.isRunning() and self.det_thread.brightness < 250:
+            self.det_thread.brightness += 25
+            if not self.det_thread.status:
+                self.det_thread.refresh()
+            self.lbl_bright.setText(str(self.det_thread.brightness // 25))
+
+    def dark(self):  # dim image
+        if self.det_thread.isRunning() and self.det_thread.brightness > -250:
+            self.det_thread.brightness -= 25
+            if not self.det_thread.status:
+                self.det_thread.refresh()
+            self.lbl_bright.setText(str(self.det_thread.brightness // 25))
 
     def animal_lock(self):  # animal_list drag enable
         if self.btn_animal_lock.isChecked():
@@ -2013,7 +2452,7 @@ class CentWidget(QWidget):  # 위젯정의
             dlg.setInputMode(QInputDialog.TextInput)
             dlg.setWindowTitle('번호 검색')
             dlg.setLabelText('검색할 파일명을 입력하세요.\n* 확장자도 입력해주세요\n* 대소문자에 주의해주세요')
-            dlg.setTextValue('Image.JPG')
+            dlg.findChild(QLineEdit).setPlaceholderText('Image.JPG')
             dlg.resize(700, 100)
             ok = dlg.exec_()
             text = dlg.textValue()
@@ -2034,7 +2473,12 @@ class CentWidget(QWidget):  # 위젯정의
         if reply == QMessageBox.Yes:
             self.table.clearContents()
             self.table.setRowCount(0)
+            self.undo_list.append(self.cache.copy())
+            self.redo_list.clear()
+            self.btn_redo.setEnabled(False)
+            self.btn_undo.setEnabled(True)
             self.cache = self.cache[0:0]
+            self.cache.to_csv(self.cache_dir, index=False)
             self.save_status = True
 
     def erase_file(self, e):  # remove image & label at trash
@@ -2048,8 +2492,7 @@ class CentWidget(QWidget):  # 위젯정의
                 shutil.move(Path(file), Path(file).parent / 'trash')
             except FileNotFoundError:
                 QMessageBox.critical(self, '파일 없음', '파일을 찾을 수 없습니다.')
-            except (PermissionError, OSError) as e:
-                print(e)
+            except (PermissionError, OSError):
                 QMessageBox.critical(self, '사용중인 파일', '파일이 다른곳에서 사용중이어서 삭제가 불가능합니다.')
             else:
                 self.det_thread.next()
@@ -2090,8 +2533,8 @@ class CentWidget(QWidget):  # 위젯정의
                     QMessageBox.critical(self, '변경 실패!', '비디오는 이곳에서 파일명을 변경할 수 없습니다.\nResult 탭에서 시도해주세요!')
 
     def rename2(self, row, col):  # rename file name at result tab  결과탭에서 파일명을 변경합니다.
-        if self.det_thread.isRunning():
-            if col == 0:
+        if col == 0:
+            if self.det_thread.isRunning():
                 path = self.det_thread.source.replace('/', '\\')
                 file = self.table.item(row, col).text()
                 old = path + '\\' + file
@@ -2112,12 +2555,15 @@ class CentWidget(QWidget):  # 위젯정의
                         os.rename(old, new)
                     except (OSError, PermissionError, FileNotFoundError):
                         QMessageBox.critical(self, '변경 실패!',
-                                             '파일명 변경에 실패했습니다.\n같은 이름의 파일이 존재하거나, 해당 파일이 열려있거나, Main탭에서 사용중입니다.')
+                                             '파일명 변경에 실패했습니다.\n같은 이름의 파일이 존재하거나, 해당 파일이 열려있거나,\n'
+                                             '파일이 존재하지 않거나, Main탭에서 사용중입니다.')
                     else:
                         self.det_thread.files[self.det_thread.files.index(old)] = new
                         self.table.setItem(row, col, QTableWidgetItem(text))
                         self.save_status = False
                         QMessageBox.information(self, '변경 완료!', f'파일명이 성공적으로 변경되었습니다.\n{file} -> {text}')
+            else:
+                QMessageBox.warning(self, '변경 불가', '이미 종료된 작업입니다.')
 
     def background(self, path):  # auto mode background path
         self.background_list.append(str(Path(path)).split('/')[-1])
@@ -2150,7 +2596,7 @@ class CentWidget(QWidget):  # 위젯정의
             self.btn_prev.setEnabled(False)
             self.btn_next.setEnabled(False)
             self.sliframe.setEnabled(False)
-            self.img2.setPixmap(QPixmap('./icon/main.JPG'))
+            self.img.setPhoto(QPixmap('./icon/main.JPG'))
             self.lbl_frame.setText('1/0')
             self.sliframe.setValue(1)
             self.lbl_cnt.setText('')
@@ -2188,19 +2634,165 @@ class CentWidget(QWidget):  # 위젯정의
                     self.det_thread.source = str(fname)
                     self.run()
 
+    def shortcutbox(self):  # 단축키
+        gbx = QGroupBox('단축키 설정')
+        big_font = QFont()
+        big_font.setBold(True)
+        big_font.setPointSize(15)
+        gbx.setFont(big_font)
+
+        self.shortcutNames = []
+        self.shortcutBtns = []
+
+        full_label = QLabel('전체 화면')
+        self.shortcutNames.append(full_label)
+        self.fullScreen_edit = QPushButton()
+        self.fullScreen_edit.setStyleSheet("background-image: url(./icon/background.jpg);")
+        self.fullScreen_edit.setFixedHeight(40)
+        self.fullScreen_edit.setFont(big_font)
+        self.fullScreen_edit.setText(self.app_data['shortcut'][0] if 'shortcut' in self.app_data.keys() else 'F')
+        self.fullScreen_edit.clicked.connect(self.setShortcut)
+        self.shortcutBtns.append(self.fullScreen_edit)
+
+        maxi_label = QLabel('창 최대화')
+        self.shortcutNames.append(maxi_label)
+        self.maximized_edit = QPushButton()
+        self.maximized_edit.setStyleSheet("background-image: url(./icon/background.jpg);")
+        self.maximized_edit.setFixedHeight(40)
+        self.maximized_edit.setFont(big_font)
+        self.maximized_edit.setText(self.app_data['shortcut'][1] if 'shortcut' in self.app_data.keys() else 'M')
+        self.maximized_edit.clicked.connect(self.setShortcut)
+        self.shortcutBtns.append(self.maximized_edit)
+
+        normal_label = QLabel('창 기본크기')
+        self.shortcutNames.append(normal_label)
+        self.normal_edit = QPushButton()
+        self.normal_edit.setStyleSheet("background-image: url(./icon/background.jpg);")
+        self.normal_edit.setFixedHeight(40)
+        self.normal_edit.setFont(big_font)
+        self.normal_edit.setText(self.app_data['shortcut'][2] if 'shortcut' in self.app_data.keys() else 'N')
+        self.normal_edit.clicked.connect(self.setShortcut)
+        self.shortcutBtns.append(self.normal_edit)
+
+        play_label = QLabel('재생/일시정지')
+        self.shortcutNames.append(play_label)
+        self.play_edit = QPushButton()
+        self.play_edit.setStyleSheet("background-image: url(./icon/background.jpg);")
+        self.play_edit.setFixedHeight(40)
+        self.play_edit.setFont(big_font)
+        self.play_edit.setText(self.app_data['shortcut'][3] if 'shortcut' in self.app_data.keys() else 'P')
+        self.play_edit.clicked.connect(self.setShortcut)
+        self.shortcutBtns.append(self.play_edit)
+
+        prev_label = QLabel('이전')
+        self.shortcutNames.append(prev_label)
+        self.prev_edit = QPushButton()
+        self.prev_edit.setStyleSheet("background-image: url(./icon/background.jpg);")
+        self.prev_edit.setFixedHeight(40)
+        self.prev_edit.setFont(big_font)
+        self.prev_edit.setText(self.app_data['shortcut'][4] if 'shortcut' in self.app_data.keys() else 'A')
+        self.prev_edit.clicked.connect(self.setShortcut)
+        self.shortcutBtns.append(self.prev_edit)
+
+        next_label = QLabel('다음')
+        self.shortcutNames.append(next_label)
+        self.next_edit = QPushButton()
+        self.next_edit.setStyleSheet("background-image: url(./icon/background.jpg);")
+        self.next_edit.setFixedHeight(40)
+        self.next_edit.setFont(big_font)
+        self.next_edit.setText(self.app_data['shortcut'][5] if 'shortcut' in self.app_data.keys() else 'D')
+        self.next_edit.clicked.connect(self.setShortcut)
+        self.shortcutBtns.append(self.next_edit)
+
+        table_label = QLabel('기록')
+        self.shortcutNames.append(table_label)
+        self.table_edit = QPushButton()
+        self.table_edit.setStyleSheet("background-image: url(./icon/background.jpg);")
+        self.table_edit.setFixedHeight(40)
+        self.table_edit.setFont(big_font)
+        self.table_edit.setText(self.app_data['shortcut'][6] if 'shortcut' in self.app_data.keys() else 'S')
+        self.table_edit.clicked.connect(self.setShortcut)
+        self.shortcutBtns.append(self.table_edit)
+
+        delete_label = QLabel('파일 삭제')
+        self.shortcutNames.append(delete_label)
+        self.delete_edit = QPushButton()
+        self.delete_edit.setStyleSheet("background-image: url(./icon/background.jpg);")
+        self.delete_edit.setFixedHeight(40)
+        self.delete_edit.setFont(big_font)
+        self.delete_edit.setText(self.app_data['shortcut'][7] if 'shortcut' in self.app_data.keys() else 'X')
+        self.delete_edit.clicked.connect(self.setShortcut)
+        self.shortcutBtns.append(self.delete_edit)
+
+        layout = QGridLayout()
+        layout.addWidget(full_label, 0, 0, 1, 1)
+        layout.addWidget(self.fullScreen_edit, 0, 1, 1, 1)
+        layout.addWidget(QLabel(), 0, 2, 1, 1)
+        layout.addWidget(maxi_label, 0, 3, 1, 1)
+        layout.addWidget(self.maximized_edit, 0, 4, 1, 1)
+        layout.addWidget(normal_label, 1, 0, 1, 1)
+        layout.addWidget(self.normal_edit, 1, 1, 1, 1)
+        layout.addWidget(QLabel(), 1, 2, 1, 1)
+        layout.addWidget(play_label, 1, 3, 1, 1)
+        layout.addWidget(self.play_edit, 1, 4, 1, 1)
+        layout.addWidget(prev_label, 2, 0, 1, 1)
+        layout.addWidget(self.prev_edit, 2, 1, 1, 1)
+        layout.addWidget(QLabel(), 2, 2, 1, 1)
+        layout.addWidget(next_label, 2, 3, 1, 1)
+        layout.addWidget(self.next_edit, 2, 4, 1, 1)
+        layout.addWidget(table_label, 3, 0, 1, 1)
+        layout.addWidget(self.table_edit, 3, 1, 1, 1)
+        layout.addWidget(QLabel(), 3, 2, 1, 1)
+        layout.addWidget(delete_label, 3, 3, 1, 1)
+        layout.addWidget(self.delete_edit, 3, 4, 1, 1)
+
+        gbx.setLayout(layout)
+        return gbx
+
+    def setShortcut(self):
+        btn = self.sender()  # 누른 버튼
+        if btn in self.shortcutBtns:  # 시그널 체크
+            id = self.shortcutBtns.index(btn)  # 인덱스
+            dlg = ShortcutDialog()
+            dlg.setWindowTitle(f'{self.shortcutNames[id].text()} 단축키 설정')
+            dlg.text.setText(f'A~Z까지의 단일키만 지원합니다.\n현재 단축키 : {btn.text()}')
+            ok = dlg.exec_()
+            if ok:
+                key = dlg.textValue()
+                keys = self.app_data['shortcut']  # 단축키 리스트
+                if (key in keys) and (keys[id] != key):  # 이미 있는 키이면 서로 바꿈
+                    self.shortcutBtns[keys.index(key)].setText(keys[id])  # 바꿈당할 버튼
+                    text = self.mainBtns[keys.index(key) - 3].text()  # 바꿈당할 메인버튼
+                    self.mainBtns[keys.index(key) - 3].setText(f'{text[:-2]}{keys[id]})')
+                    btn.setText(key)  # 바꿈을 원하는 버튼
+                    text2 = self.mainBtns[id - 3].text()
+                    self.mainBtns[id - 3].setText(f'{text2[:-2]}{key})')
+                else:  # 없는 키이면 그냥 지정
+                    btn.setText(key)
+                    text2 = self.mainBtns[id - 3].text()
+                    self.mainBtns[id - 3].setText(f'{text2[:-2]}{key})')
+                self.app_data['shortcut'] = [btn.text() for btn in self.shortcutBtns]
+
     def autogroup(self):  # select mode
         gbx = QGroupBox('모드 변경')
+        big_font = QFont()
+        big_font.setBold(True)
+        big_font.setPointSize(15)
+        gbx.setFont(big_font)
         self.auto = QRadioButton('자동분류(Beta)')
+        self.auto.setFont(big_font)
         self.auto.clicked.connect(self.automatic)
         self.auto.setToolTip('딥러닝모델이 멧돼지, 고라니, 산양이 감지되었는지 여부를 판단하여 일차분류합니다.')
         self.auto.setStatusTip('딥러닝모델이 멧돼지 고라니, 산양이 감지되었는지 여부를 판단하여 일차분류합니다.')
         self.manual = QRadioButton('수동검수')
+        self.manual.setFont(big_font)
         self.manual.setChecked(True)
         self.manual.clicked.connect(self.automatic)
         hbox = QHBoxLayout()
         hbox.addWidget(self.auto)
         hbox.addWidget(self.manual)
         gbx.setLayout(hbox)
+        gbx.setFixedHeight(100)
         return gbx
 
     def automatic(self):  # when try to mode change
@@ -2233,7 +2825,8 @@ class CentWidget(QWidget):  # 위젯정의
         elif ani_num == 3:  # unknown
             self.list_animal.setCurrentItem(self.animal_none)  # unknown도 미동정으로
         else:
-            self.list_animal.setCurrentItem(self.animal_none)  # 안잡히면 미동정
+            # self.list_animal.setCurrentItem(self.animal_none)  # 안잡히면 미동정
+            pass  # 안잡히면 미처리
 
     def move_file(self, _):  # When file_num doubleclick at main tab (status bar)
         if not self.det_thread.status:
@@ -2273,7 +2866,7 @@ class CentWidget(QWidget):  # 위젯정의
         dlg.setInputMode(QInputDialog.TextInput)
         dlg.setWindowTitle('간편 목록 추가')
         dlg.setLabelText("추가할 동물종명(국명)을 입력하세요\n예시) 멧돼지")
-        dlg.setTextValue('멧돼지')
+        dlg.findChild(QLineEdit).setPlaceholderText('멧돼지')
         dlg.resize(700, 100)
         ok = dlg.exec_()
         text = dlg.textValue().strip()
@@ -2298,9 +2891,13 @@ class CentWidget(QWidget):  # 위젯정의
                                             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
                 if reply == QMessageBox.Yes:
                     ani = self.list_animal.takeItem(self.list_animal.currentRow()).text()
-                    self.app_data['category'].remove(ani)
-                    with open(self.app_data_dir, 'w', encoding='utf-8') as f:
-                        yaml.dump(self.app_data, f)
+                    try:
+                        self.app_data['category'].remove(ani)
+                    except ValueError:
+                        pass
+                    else:
+                        with open(self.app_data_dir, 'w', encoding='utf-8') as f:
+                            yaml.dump(self.app_data, f)
 
     def noon_night(self):  # Main tab / 주야 구분
         self.noon_btn = QRadioButton('주간')
@@ -2328,34 +2925,46 @@ class CentWidget(QWidget):  # 위젯정의
         gbx = QGroupBox()
         gbx.setToolTip('온도를 기록합니다. 화씨는 자동으로 섭씨로 계산됩니다.')
         gbx.setStatusTip('온도를 기록합니다. 화씨는 자동으로 섭씨로 계산됩니다.')
-        self.celsius = QRadioButton('섭씨')
+        self.celsius = QRadioButton('섭씨C')
         self.celsius.setChecked(True)
         self.celsius.toggled.connect(self.show_temperature)
-        self.fahrenheit = QRadioButton('화씨')
+        self.fahrenheit = QRadioButton('화씨F')
         self.temp = QSpinBox(self)
         self.temp.setRange(-1000, 1000)
-        self.temp.setSuffix(" °C")
+        # self.temp.setSuffix(" °C")
+        # rww2
+        # self.celsius_text = QLabel("°C")
         self.temp.setValue(0)
         self.temp.valueChanged.connect(self.show_temperature)
         hbox = QHBoxLayout()
         hbox.addWidget(self.celsius)
         hbox.addWidget(self.fahrenheit)
+
+        # h2box = QHBoxLayout()
+        # h2box.addWidget(self.temp,2)
+        # h2box.addWidget(self.celsius_text)
+
         vbox = QVBoxLayout()
         vbox.addLayout(hbox)
+        # vbox.addLayout(h2box)
         vbox.addWidget(self.temp)
         gbx.setLayout(vbox)
         return gbx
 
     def show_temperature(self):  # temperature to sample_table
         if self.celsius.isChecked():
-            self.temp.setSuffix(" °C")
+            # self.celsius_text.setText("°C") #rww2
             self.sample_table.setItem(0, 10, QTableWidgetItem(str(self.temp.value())))
         else:
-            self.temp.setSuffix(" °F")
+            # self.celsius_text.setText("°F") #rww2
             self.sample_table.setItem(0, 10, QTableWidgetItem(str(round((self.temp.value() - 32) * 5 / 9))))
 
     def submit(self):  # Main tab / Save and run thread
         self.btn_submit.setEnabled(False)
+        self.undo_list.append(self.cache.copy())
+        self.redo_list.clear()
+        self.btn_redo.setEnabled(False)
+        self.btn_undo.setEnabled(True)
         if self.chk_autorename.isChecked():
             file = self.det_thread.path
             suffix = file.split('.')[-1]
@@ -2374,15 +2983,19 @@ class CentWidget(QWidget):  # 위젯정의
             else:
                 self.det_thread.files[self.det_thread.count] = new
                 self.det_thread.path = path + text
-                self.sample_table.setItem(0, 0, QTableWidgetItem(text))
         col = self.sample_table.columnCount()
         row = self.table.rowCount()
         self.table.setRowCount(row + 1)
+        self.table.blockSignals(True)
+        data = {}
         for i in range(col):
             item = '' if self.sample_table.item(0, i) is None else self.sample_table.item(0, i).text()
+            data[str(self.sample_table.horizontalHeaderItem(i).text())] = item
             self.table.setItem(row, i, QTableWidgetItem(item))
         self.save_status = False
+        self.cache = self.cache.append(data, ignore_index=True)
         QTest.qWait(100)
+        self.table.blockSignals(False)
         try:
             self.cache.to_csv(self.cache_dir, index=False)
         except Exception as e:
@@ -2397,15 +3010,16 @@ class CentWidget(QWidget):  # 위젯정의
     def hlbl(self):  # hide label
         if self.chk_hlbl.isChecked():
             self.det_thread.hide_labels = True
+            self.chk_hconf.setChecked(True)
         else:
             self.det_thread.hide_labels = False
-            self.chk_hconf.setChecked(False)
 
     def hconf(self):  # hide conf
         if self.chk_hconf.isChecked():
             self.det_thread.hide_conf = True
         else:
             self.det_thread.hide_conf = False
+            self.chk_hlbl.setChecked(False)
 
     def unknown(self):  # show unknown
         if self.chk_unknown.isChecked():
@@ -2413,15 +3027,27 @@ class CentWidget(QWidget):  # 위젯정의
         else:
             self.det_thread.unknown = False
 
+    # rww1
+    def tableEditMode(self):
+        if self.chk_editmode.isChecked():
+            self.sample_table.setEditTriggers(QAbstractItemView.DoubleClicked)
+        else:
+            self.sample_table.setEditTriggers(QAbstractItemView.AllEditTriggers)
+
     def weights(self):  # select model
         gbx = QGroupBox('모델')
+        big_font = QFont()
+        big_font.setBold(True)
+        big_font.setPointSize(15)
+        gbx.setFont(big_font)
         self.btn_weights = QComboBox(self)
+        self.btn_weights.setFont(big_font)
         [self.btn_weights.addItem(i) for i in ["멧돼지와 고라니", "멧돼지와 고라니와 산양", "사용 안함"]]
+        self.btn_weights.setCurrentIndex(int(self.app_data['weight']) if 'weight' in self.app_data.keys() else 0)
         self.btn_weights.setFixedHeight(60)
         self.btn_weights.setStyleSheet("background-image: url(./icon/background.jpg);")
         self.btn_weights.setToolTip('어떤 모델을 사용하여 영상처리를 진행할지 선택합니다.')
         self.btn_weights.setStatusTip('어떤 모델을 사용하여 영상처리를 진행할지 선택합니다.')
-        self.btn_weights.activated[str].connect(self.det_thread.model)
         self.btn_weights.activated[str].connect(self.weight_select)
         gbox = QGridLayout()
         gbox.addWidget(self.btn_weights, 0, 0, 1, 3)
@@ -2444,36 +3070,28 @@ class CentWidget(QWidget):  # 위젯정의
             QMessageBox.information(self, '주의사항', '프로그램을 사용하는 도중에 해당 폴더 안의 사진 또는 영상의 이름을 변경하거나 삭제하지 마십시오.')
             fname = QFileDialog.getExistingDirectory(self)  # fname = /
             if fname:
-                reply = QMessageBox.Yes
-                for drive in DRIVE:
-                    if fname.startswith(drive):
-                        reply = QMessageBox.warning(self, '이동식디스크',
-                                                    '이동식디스크(USB, SD카드 등)로 판단됩니다. 파일 삭제 시 복구가 불가능합니다.\n'
-                                                    '하드디스크로 복사해서 처리하는 것을 권장합니다.\n계속하시겠습니까?',
-                                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-                if reply == QMessageBox.Yes:
-                    p = str(Path(str(fname)).resolve())  # os-agnostic absolute path p = \
-                    files = natsorted(glob(os.path.join(p, '*.*')))  # dir
-                    images = [x for x in files if x.split('.')[-1].lower() in IMG_FORMATS]
-                    videos = [x for x in files if x.split('.')[-1].lower() in VID_FORMATS]
-                    ni, nv = len(images), len(videos)
-                    nf = ni + nv
-                    if not nf:
-                        QMessageBox.critical(self, '파일 없음', f'해당 폴더에 사진이나 영상을 찾지 못했습니다.\n{p}\n지원되는 확장자는:\n'
-                                                            f'사진: {IMG_FORMATS}\n영상: {VID_FORMATS}', QMessageBox.Ok)
-                    else:
-                        self.lbl_source.setText(str(fname))
-                        self.det_thread.source = str(fname)
-                        reply = QMessageBox.question(self, '실행',
-                                                     f'{str(fname)} 폴더 안의 파일들을 실행하시겠습니까?\n사진 : {ni}개, 영상 : {nv}개',
-                                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-                        if reply == QMessageBox.Yes:
-                            os.makedirs(Path(p) / 'trash', exist_ok=True)
-                            self.run()
+                p = str(Path(str(fname)).resolve())  # os-agnostic absolute path p = \
+                files = natsorted(glob(os.path.join(p, '*.*')))  # dir
+                images = [x for x in files if x.split('.')[-1].lower() in IMG_FORMATS]
+                videos = [x for x in files if x.split('.')[-1].lower() in VID_FORMATS]
+                ni, nv = len(images), len(videos)
+                nf = ni + nv
+                if not nf:
+                    QMessageBox.critical(self, '파일 없음', f'해당 폴더에 사진이나 영상을 찾지 못했습니다.\n{p}\n지원되는 확장자는:\n'
+                                                        f'사진: {IMG_FORMATS}\n영상: {VID_FORMATS}', QMessageBox.Ok)
+                else:
+                    self.lbl_source.setText(str(fname))
+                    self.det_thread.source = str(fname)
+                    reply = QMessageBox.question(self, '실행',
+                                                 f'{str(fname)} 폴더 안의 파일들을 실행하시겠습니까?\n사진 : {ni}개, 영상 : {nv}개',
+                                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                    if reply == QMessageBox.Yes:
+                        os.makedirs(Path(p) / 'trash', exist_ok=True)
+                        self.lbl_trash.setText('제거파일 위치 : ' + str(Path(p) / 'trash'))
+                        self.run()
 
     def disable(self, e):  # disable btn
         if e:
-            self.lbl_source.setEnabled(False)
             self.btn_source.setEnabled(False)
             self.auto.setEnabled(False)
             self.manual.setEnabled(False)
@@ -2483,7 +3101,12 @@ class CentWidget(QWidget):  # 위젯정의
 
     def imgsz(self):  # inference size(pixel)
         gbx = QGroupBox('사진 분할개수')
+        big_font = QFont()
+        big_font.setBold(True)
+        big_font.setPointSize(15)
+        gbx.setFont(big_font)
         btn_imgsz = QComboBox(self)
+        btn_imgsz.setFont(big_font)
         [btn_imgsz.addItem(i) for i in ["1280", "960", "640", "480", "320", "128"]]
         btn_imgsz.setCurrentIndex(3)
         btn_imgsz.setFixedHeight(60)
@@ -2512,11 +3135,9 @@ class CentWidget(QWidget):  # 위젯정의
         if ok:
             self.lbl_conf.setText(str(num) + '%')
             self.sliconf.setValue(num)
-            self.det_thread.conf_thres = num / 100
 
     def conf_chg(self):
         self.lbl_conf.setText(str(self.sliconf.value()) + '%')
-        self.det_thread.conf_thres = int(self.sliconf.value()) / 100
 
     def show_conf(self, conf):
         max_conf, min_conf = conf
@@ -2537,7 +3158,6 @@ class CentWidget(QWidget):  # 위젯정의
         num = dlg.intValue()
         if ok:
             self.lbl_ltk.setNum(num)
-            self.det_thread.line_thickness = num
 
     def mag(self, raw):  # 확대를 위한 원본 이미지 함수
         self.raw = raw
@@ -2556,6 +3176,9 @@ class CentWidget(QWidget):  # 위젯정의
             self.det_thread.device = 'cpu'
         else:
             self.det_thread.device = ''
+        self.det_thread.line_thickness = int(self.lbl_ltk.text())
+        self.det_thread.conf_thres = int(self.sliconf.value()) / 100
+        self.det_thread.model(self.btn_weights.currentText())
         self.det_thread.start()
 
     def stop(self):  # 쓰레드 정지
@@ -2572,7 +3195,7 @@ class CentWidget(QWidget):  # 위젯정의
             self.btn_next.setEnabled(False)
             self.sliframe.setEnabled(False)
             self.list_animal.setCurrentItem(self.animal_none)
-            self.img2.setPixmap(QPixmap('./icon/main.JPG'))
+            self.img.setPhoto(QPixmap('./icon/main.JPG'))
             self.lbl_frame.setText('1/0')
             self.sliframe.setValue(1)
             self.lbl_cnt.setText('')
@@ -2601,6 +3224,10 @@ class CentWidget(QWidget):  # 위젯정의
                 self.manual.setChecked(True)
 
     def df_chg(self, item):  # edit result table change cache data  결과테이블에서 변경한 데이터를 캐시 데이터에 반영
+        self.undo_list.append(self.cache.copy())
+        self.redo_list.clear()
+        self.btn_redo.setEnabled(False)
+        self.btn_undo.setEnabled(True)
         try:
             self.cache.iloc[item.row(), item.column()] = item.text()
         except IndexError:  # rewrite cache
@@ -2625,16 +3252,24 @@ class CentWidget(QWidget):  # 위젯정의
             except Exception as e:
                 logger.error('df_chg save error', exc_info=e)
 
+    def set_image(self, img):
+        self.det_img = img
+
     @staticmethod
     def show_image(img_src, label):  # image2pixmap
         try:
-            w = label.geometry().width()
-            h = label.geometry().height()
-            img_src_ = cv2.resize(img_src, (w, h), interpolation=cv2.INTER_AREA)
-            frame = cv2.cvtColor(img_src_, cv2.COLOR_BGR2RGB)
+            # w = label.geometry().width()
+            # h = label.geometry().height()
+            # img_src_ = cv2.resize(img_src, (w, h), interpolation=cv2.INTER_AREA)
+            # frame = cv2.cvtColor(img_src_, cv2.COLOR_BGR2RGB)
+            # img = QImage(frame.data, frame.shape[1], frame.shape[0], frame.shape[2] * frame.shape[1],
+            #              QImage.Format_RGB888)
+            # label.setPixmap(QPixmap.fromImage(img))
+            img_src = cv2.resize(img_src, (0, 0), fx=2, fy=2, interpolation=cv2.INTER_AREA)
+            frame = cv2.cvtColor(img_src, cv2.COLOR_BGR2RGB)
             img = QImage(frame.data, frame.shape[1], frame.shape[0], frame.shape[2] * frame.shape[1],
                          QImage.Format_RGB888)
-            label.setPixmap(QPixmap.fromImage(img))
+            label.setPhoto(QPixmap.fromImage(img))
         except Exception as e:
             logger.warning('show_image error', exc_info=e)
 
@@ -2721,6 +3356,10 @@ class CentWidget(QWidget):  # 위젯정의
         self.sample_table.setItem(0, 5, QTableWidgetItem(str(adj_time.minute)))
 
     def add_column(self):  # add columns to table  칼럼 추가
+        self.undo_list.append(self.cache.copy())
+        self.redo_list.clear()
+        self.btn_redo.setEnabled(False)
+        self.btn_undo.setEnabled(True)
         dlg = QInputDialog(self)
         dlg.setWindowIcon(icon)
         dlg.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint)
@@ -2728,11 +3367,15 @@ class CentWidget(QWidget):  # 위젯정의
         dlg.setWindowTitle('칼럼 추가')
         dlg.setLabelText('추가할 칼럼이름을 입력하세요\n여러 개 입력 시 "/"키로 구분해 주세요')
         dlg.resize(700, 100)
-        dlg.resize(700, 100)
         ok = dlg.exec_()
-        text = [x for x in dlg.textValue().split('/') if x not in self.app_data['columns']]  # 중복칼럼제거
+        text = []
+        val = dlg.textValue().split('/')
+        for name in val:
+            if (name not in self.app_data['columns']) and (name not in text):
+                text.append(name)
         if ok and text:
             self.app_data['columns'] += text
+            self.cache[text] = ''
             self.table.setColumnCount(len(self.app_data['columns']))
             self.table.setHorizontalHeaderLabels(self.app_data['columns'])
             self.sample_table.setColumnCount(len(self.app_data['columns']))
@@ -2740,10 +3383,15 @@ class CentWidget(QWidget):  # 위젯정의
             try:
                 with open(self.app_data_dir, 'w', encoding='utf-8') as f:
                     yaml.dump(self.app_data, f)
+                self.cache.to_csv(self.cache_dir, index=False)
             except Exception as e:
                 logger.error('add_column error', exc_info=e)
 
     def remove_column(self):  # remove columns to table  칼럼 제거
+        self.undo_list.append(self.cache.copy())
+        self.redo_list.clear()
+        self.btn_redo.setEnabled(False)
+        self.btn_undo.setEnabled(True)
         dlg = QInputDialog(self)
         dlg.setWindowIcon(icon)
         dlg.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint)
@@ -2761,12 +3409,16 @@ class CentWidget(QWidget):  # 위젯정의
                 success = []
                 fail = []
                 for name in text:
-                    try:
-                        self.app_data['columns'].remove(name)
-                    except ValueError:
+                    if name in DEFAULT_COLUMNS:
                         fail.append(name)
                     else:
-                        success.append(name)
+                        try:
+                            self.app_data['columns'].remove(name)
+                        except ValueError:
+                            fail.append(name)
+                        else:
+                            success.append(name)
+                self.cache.drop(success, axis=1, inplace=True)
                 self.table.setColumnCount(len(self.app_data['columns']))
                 self.table.setHorizontalHeaderLabels(self.app_data['columns'])
                 self.sample_table.setColumnCount(len(self.app_data['columns']))
@@ -2774,20 +3426,11 @@ class CentWidget(QWidget):  # 위젯정의
                 try:
                     with open(self.app_data_dir, 'w', encoding='utf-8') as file:
                         yaml.dump(self.app_data, file)
+                    self.cache.to_csv(self.cache_dir, index=False)
                 except Exception as e:
                     logger.error('remove_column error', exc_info=e)
                 QMessageBox.information(self, '칼럼 제거 결과',
                                         f"칼럼 제거 성공 : {', '.join(success)}\n칼럼 제거 실패 : {', '.join(fail)}")
-
-    # def save_txt(self):
-    #     if self.chk_lbl.isChecked():
-    #         self.lbl_txt.setEnabled(True)
-    #         self.btn_txt.setEnabled(True)
-    #         self.det_thread.save_txt = True
-    #     else:
-    #         self.lbl_txt.setEnabled(False)
-    #         self.btn_txt.setEnabled(False)
-    #         self.det_thread.save_txt = False
 
     def save_df(self):  # save result table to excel  결과 테이블을 엑셀로 저장합니다
         now = datetime.now().strftime('%Y%m%d%H%M')
@@ -2824,28 +3467,18 @@ class CentWidget(QWidget):  # 위젯정의
                 self.save_status = True
 
     def rm_data(self):  # remove result table one line  입력한 숫자의 행을 지웁니다.
-        row = self.table.rowCount()
-        dlg = QInputDialog(self)
-        dlg.setWindowIcon(icon)
-        dlg.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint)
-        dlg.setInputMode(QInputDialog.IntInput)
-        dlg.setWindowTitle('행 삭제')
-        dlg.setLabelText("입력한 숫자의 행을 지웁니다.")
-        dlg.resize(500, 100)
-        dlg.setIntRange(1, row)
-        dlg.setIntValue(row)
-        ok = dlg.exec_()
-        num = dlg.intValue()
-        if ok:
-            try:
-                self.table.removeRow(num - 1)
-                self.cache = self.cache.drop(num - 1).reset_index(drop=True)
-                self.cache.to_csv(self.cache_dir, index=False)
-            except Exception as e:
-                QMessageBox.warning(self, 'Warning!', f'에러코드{type(e)} {e}', QMessageBox.Ok)
-                logger.error('rm_data error', exc_info=e)
-            else:
-                self.save_status = False
+        reply = QMessageBox.question(self, '테이블 제거', '현재 선택된 모든 행들을 제거하시겠습니까?',
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.undo_list.append(self.cache.copy())
+            self.redo_list.clear()
+            self.btn_redo.setEnabled(False)
+            self.btn_undo.setEnabled(True)
+            indexes = [row.row() for row in self.table.selectionModel().selectedRows()]
+            for index in sorted(indexes, reverse=True):
+                self.table.removeRow(index)
+                self.cache = self.cache.drop(index).reset_index(drop=True)
+            self.cache.to_csv(self.cache_dir, index=False)
 
     def night(self, e):  # Main tab / auto judge noon or night  주/야간을 판단합니다.
         if e:
@@ -2905,45 +3538,13 @@ class CentWidget(QWidget):  # 위젯정의
             self.options.setEnabled(True)
             self.btn_add_li.setEnabled(True)
             self.btn_rm_file.setEnabled(True)
-            if self.lbl_cnt.text().split('/')[0] == '1':  # If progress is first file
-                self.btn_prev.setEnabled(False)
-            if self.lbl_cnt.text().split('/')[0] == self.lbl_cnt.text().split('/')[1]:  # If progress is last file
-                self.btn_next.setEnabled(False)
             QTest.qWait(200)
-            self.btn_prev.setEnabled(True)
-            self.btn_next.setEnabled(True)
+            if self.lbl_cnt.text().split('/')[1] != '1':  # multi files
+                if self.lbl_cnt.text().split('/')[0] != '1':  # If progress is first file
+                    self.btn_prev.setEnabled(True)
+                if self.lbl_cnt.text().split('/')[0] != self.lbl_cnt.text().split('/')[1]:  # If progress is last file
+                    self.btn_next.setEnabled(True)
 
 
-# class GroupBox(QGroupBox):  # reverse gbx
-#     def paintEvent(self, event):
-#         painter = QStylePainter(self)
-#         option = QStyleOptionGroupBox()
-#         self.initStyleOption(option)
-#         if self.isCheckable():
-#             option.state &= ~QStyle.State_Off & ~QStyle.State_On
-#             option.state |= (
-#                 QStyle.State_Off
-#                 if self.isChecked()
-#                 else QStyle.State_On
-#             )
-#         painter.drawComplexControl(QStyle.CC_GroupBox, option)
-
-ex = MyApp()
+start = MyApp()
 sys.exit(app.exec_())
-
-# if __name__ == '__main__':
-# app = QApplication(sys.argv)
-# screen = app.primaryScreen()
-# size = screen.size()
-# w = size.width()
-# h = size.height()
-# scal = (h - 200) / h
-# ex = MyApp()
-# ex.move(0, 0)
-# ex.setFixedSize(int(scal * w), h - 200)
-# ex.setGeometry(int(0.1 * w), int(0.1 * h), int(0.8 * w), int(0.8 * h))
-# ex.setGeometry(50,50, 1000, 600)
-# ex.showMaximized()
-# ex.showFullScreen()
-# ex2 = StartWidget()
-# sys.exit(app.exec_())
